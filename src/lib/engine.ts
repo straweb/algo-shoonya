@@ -12,6 +12,7 @@ import { buildLegs } from "./plan";
 import { blackScholes, gaussian, roundTick } from "./pricing";
 import { istNow, isMarketOpen, hhmmToMinutes } from "./market";
 import { shoonyaLogin, shoonyaPlaceOrder, shoonyaQuote, ShoonyaCreds } from "./shoonya";
+import { getScanner } from "./scanner";
 
 const TICK_MS = 3000;
 const TICK_VOL = 0.0002; // ~0.02% per 3s tick  ->  ~2% intraday
@@ -646,6 +647,8 @@ export function getEngine(): Engine {
   }
   g.__shoonyaAlgoEngine = fresh;
   fresh.start();
+  // the stock scanner rides on the same lifecycle
+  getScanner().start();
   return fresh;
 }
 

@@ -114,3 +114,50 @@ model Event {
   message      String
   createdAt    DateTime  @default(now())
 }
+
+// ---------- Stock scanner ----------
+
+model ScannerConfig {
+  id              String   @id @default("global")
+  enabled         Boolean  @default(false)
+  strategy        String   @default("ORB") // ORB | MOMENTUM
+  autoPlace       Boolean  @default(true)
+  mode            String   @default("PAPER") // PAPER | LIVE
+  capitalPerTrade Float    @default(100000)
+  slPct           Float    @default(0.5)
+  targetPct       Float    @default(1.0)
+  squareOffTime   String   @default("15:15")
+  symbols         String   @default("") // CSV of enabled stock symbols
+  updatedAt       DateTime @updatedAt
+}
+
+model ScanSignal {
+  id        String   @id @default(cuid())
+  symbol    String
+  strategy  String // ORB | MOMENTUM
+  side      String // LONG | SHORT
+  refPrice  Float // reference (range edge / day open)
+  price     Float // trigger price
+  note      String
+  placed    Boolean  @default(false)
+  tradeId   String?
+  createdAt DateTime @default(now())
+}
+
+model ScanTrade {
+  id          String    @id @default(cuid())
+  signalId    String?
+  symbol      String
+  side        String // LONG | SHORT
+  qty         Int
+  entryPrice  Float
+  exitPrice   Float?
+  ltp         Float?
+  slPrice     Float?
+  targetPrice Float?
+  mode        String    @default("PAPER") // PAPER | LIVE
+  status      String    @default("OPEN") // OPEN | CLOSED_SL | CLOSED_TARGET | CLOSED_TIME | CLOSED_MANUAL | REJECTED
+  realizedPnl Float     @default(0)
+  openedAt    DateTime  @default(now())
+  closedAt    DateTime?
+}

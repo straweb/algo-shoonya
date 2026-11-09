@@ -10,12 +10,16 @@ import { Deployments } from "@/components/deployments";
 import { OrderLog } from "@/components/orderlog";
 import { SettingsView } from "@/components/settings";
 import { DeployWizard } from "@/components/deploy-wizard";
+import { Backtest } from "@/components/backtest";
+import { Scanner } from "@/components/scanner";
 import { Toaster } from "@/components/ui/toaster";
 
 function Views() {
   const { tab } = useAppStore();
   switch (tab) {
     case "strategies": return <Strategies />;
+    case "backtest": return <Backtest />;
+    case "scanner": return <Scanner />;
     case "deployments": return <Deployments />;
     case "orders": return <OrderLog />;
     case "settings": return <SettingsView />;

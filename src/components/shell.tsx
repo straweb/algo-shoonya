@@ -1,7 +1,7 @@
 "use client";
 
 import { useTheme } from "next-themes";
-import { ChartCandlestick, LayoutDashboard, Zap, Rocket, ListOrdered, Settings, Sun, Moon, RadioTower, WifiOff } from "lucide-react";
+import { ChartCandlestick, LayoutDashboard, Zap, Rocket, ListOrdered, Settings, Sun, Moon, RadioTower, WifiOff, FlaskConical, Radar } from "lucide-react";
 import { useAppStore, TabId } from "@/lib/store";
 import { cn } from "@/lib/utils";
 import { usePoll } from "@/lib/use-poll";
@@ -11,6 +11,8 @@ import { Button } from "@/components/ui/button";
 const TABS: Array<{ id: TabId; label: string; icon: typeof Zap }> = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "strategies", label: "Strategies", icon: Zap },
+  { id: "backtest", label: "Backtest", icon: FlaskConical },
+  { id: "scanner", label: "Scanner", icon: Radar },
   { id: "deployments", label: "Deployments", icon: Rocket },
   { id: "orders", label: "Orders", icon: ListOrdered },
   { id: "settings", label: "Settings", icon: Settings },

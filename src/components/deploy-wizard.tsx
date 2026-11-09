@@ -19,10 +19,10 @@ import { getStrategy } from "@/lib/strategies";
 import { INSTRUMENT_LIST } from "@/lib/instruments";
 import { SizingData, ExpiryInfo, inr } from "@/lib/client-types";
 import { cn } from "@/lib/utils";
-import { ChevronLeft, ChevronRight, AlertTriangle, CalendarDays, Check } from "lucide-react";
+import { ChevronLeft, ChevronRight, AlertTriangle, CalendarDays, Check, Layers } from "lucide-react";
 
 interface WizardState {
-  instrument: string;
+  instruments: string[]; // multi-index — one deployment created per index
   expiryMode: "NEAREST" | "NEXT";
   mode: "PAPER" | "LIVE";
   capital: number;
@@ -37,13 +37,13 @@ interface WizardState {
   startNow: boolean;
 }
 
-const STEP_TITLES = ["Strategy & Instrument", "Capital & Sizing", "Risk & Timing", "Review & Deploy"];
+const STEP_TITLES = ["Strategy & Indices", "Capital & Sizing", "Risk & Timing", "Review & Deploy"];
 
 export function DeployWizard() {
   const { wizardStrategy, closeWizard, setTab } = useAppStore();
   const { toast } = useToast();
   const [step, setStep] = useState(0);
-  const [sizing, setSizing] = useState<SizingData | null>(null);
+  const [sizingMap, setSizingMap] = useState<Record<string, SizingData>>({});
   const [expiryInfo, setExpiryInfo] = useState<ExpiryInfo | null>(null);
   const [activeInstruments, setActiveInstruments] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
@@ -51,7 +51,7 @@ export function DeployWizard() {
   const strat = useMemo(() => (wizardStrategy ? getStrategy(wizardStrategy) : null), [wizardStrategy]);
 
   const [w, setW] = useState<WizardState>({
-    instrument: "NIFTY",
+    instruments: ["NIFTY"],
     expiryMode: "NEAREST",
     mode: "PAPER",
     capital: 200000,
@@ -72,11 +72,12 @@ export function DeployWizard() {
   useEffect(() => {
     if (!strat) return;
     setStep(0);
+    setSizingMap({});
     setW((p) => ({
       ...p,
       entryTime: strat.entryTime,
       squareOffTime: strat.squareOffTime,
-      name: `NIFTY ${strat.name}`,
+      name: `${p.instruments.join(" + ")} ${strat.name}`,
       otmGap: "",
       wingGap: "",
       targetProfit: "",
@@ -91,53 +92,81 @@ export function DeployWizard() {
       .then((j: { settings: { activeInstruments: string } }) => {
         const list = j.settings.activeInstruments.split(",");
         setActiveInstruments(list);
-        setW((p) => ({ ...p, instrument: list.includes(p.instrument) ? p.instrument : list[0] ?? "NIFTY" }));
+        setW((p) => {
+          const keep = p.instruments.filter((i) => list.includes(i));
+          return { ...p, instruments: keep.length ? keep : [list[0] ?? "NIFTY"] };
+        });
       })
       .catch(() => setActiveInstruments(["NIFTY", "BANKNIFTY"]));
   }, [wizardStrategy]);
 
-  // expiry info for chosen instrument
+  // expiry info for the primary instrument
   const loadExpiry = useCallback(() => {
     if (!wizardStrategy) return;
-    fetch(`/api/expiries?instrument=${w.instrument}`, { cache: "no-store" })
+    fetch(`/api/expiries?instrument=${w.instruments[0] ?? "NIFTY"}`, { cache: "no-store" })
       .then((r) => r.json())
       .then((j: ExpiryInfo) => setExpiryInfo(j))
       .catch(() => {});
-  }, [w.instrument, wizardStrategy]);
+  }, [w.instruments, wizardStrategy]);
 
   useEffect(() => { loadExpiry(); }, [loadExpiry]);
 
-  // sizing estimate
+  // sizing estimates — one per selected index, capital split evenly
+  const instKey = w.instruments.join(",");
   useEffect(() => {
-    if (!wizardStrategy || !strat) return;
+    if (!wizardStrategy || !strat || w.instruments.length === 0) return;
     const t = setTimeout(() => {
-      apiCall<{ sizing: SizingData }>("/api/estimate", "POST", {
-        strategyId: strat.id,
-        instrumentId: w.instrument,
-        capital: w.capital,
-        utilizationPct: w.utilizationPct,
-        otmGap: parseInt(w.otmGap || "0", 10),
-        wingGap: parseInt(w.wingGap || "0", 10),
-      }).then((j) => setSizing(j.sizing)).catch(() => {});
+      const perIndex = w.capital / w.instruments.length;
+      Promise.all(
+        w.instruments.map((instId) =>
+          apiCall<{ sizing: SizingData }>("/api/estimate", "POST", {
+            strategyId: strat.id,
+            instrumentId: instId,
+            capital: perIndex,
+            utilizationPct: w.utilizationPct,
+            otmGap: parseInt(w.otmGap || "0", 10),
+            wingGap: parseInt(w.wingGap || "0", 10),
+          }).then((j) => [instId, j.sizing] as const),
+        ),
+      )
+        .then((entries) => setSizingMap(Object.fromEntries(entries)))
+        .catch(() => {});
     }, 250);
     return () => clearTimeout(t);
-  }, [wizardStrategy, strat, w.instrument, w.capital, w.utilizationPct, w.otmGap, w.wingGap]);
+  }, [wizardStrategy, strat, instKey, w.capital, w.utilizationPct, w.otmGap, w.wingGap]);
 
   if (!strat) return null;
 
-  const isBuy = strat.category === "OPTION BUYING";
   const calendar = strat.calendar;
   const showOtmGap = strat.needsOtmGap;
   const showWingGap = strat.needsWingGap;
   const dirFixed = strat.direction;
+  const nIdx = w.instruments.length;
+  const perIndexCapital = Math.floor(w.capital / Math.max(nIdx, 1));
+
+  const toggleInstrument = (k: string) => {
+    const has = w.instruments.includes(k);
+    if (has) {
+      if (w.instruments.length > 1) set("instruments", w.instruments.filter((x) => x !== k));
+    } else {
+      set("instruments", [...w.instruments, k].sort(
+        (a, b) => INSTRUMENT_LIST.findIndex((i) => i.id === a) - INSTRUMENT_LIST.findIndex((i) => i.id === b),
+      ));
+    }
+  };
 
   const validateStep = (): string | null => {
     if (step === 0) {
-      if (!activeInstruments.includes(w.instrument)) return "Pick a tradeable instrument.";
+      if (w.instruments.length === 0) return "Select at least one index.";
+      if (!w.instruments.every((i) => activeInstruments.includes(i))) return "All selected indices must be tradeable (enable them in Settings).";
     }
     if (step === 1) {
       if (!Number.isFinite(w.capital) || w.capital < 50000) return "Minimum capital allocation is ₹50,000.";
-      if (sizing && !sizing.sufficient) return `Allocated capital is below the estimated margin need of ${inr(sizing.estMarginPerLot)} per lot.`;
+      if (perIndexCapital < 50000) return `With ${nIdx} indices each gets ${inr(perIndexCapital)} — minimum is ₹50,000 per index.`;
+      const insufficient = w.instruments.find((i) => sizingMap[i] && !sizingMap[i].sufficient);
+      if (insufficient && sizingMap[insufficient]) {
+        return `${insufficient}: allocated capital is below the estimated margin need of ${inr(sizingMap[insufficient].estMarginPerLot)} per lot.`;
+      }
     }
     if (step === 2) {
       if (w.entryTime >= w.squareOffTime) return "Entry time must be before square-off time.";
@@ -151,7 +180,7 @@ export function DeployWizard() {
     const err = validateStep();
     if (err) return toast({ title: "Check your inputs", description: err, variant: "destructive" });
     if (step < 3) {
-      if (step === 0) set("name", `${w.instrument} ${strat.name}`);
+      if (step === 0) set("name", `${w.instruments.join(" + ")} ${strat.name}`);
       setStep(step + 1);
     }
   };
@@ -159,24 +188,35 @@ export function DeployWizard() {
   const deploy = async () => {
     setBusy(true);
     try {
-      await apiCall("/api/deployments", "POST", {
-        name: w.name || `${w.instrument} ${strat.name}`,
-        strategyType: strat.id,
-        instrument: w.instrument,
-        expiryMode: calendar ? "NEAREST" : w.expiryMode,
-        direction: dirFixed !== "AUTO" ? dirFixed : "AUTO",
-        mode: w.mode,
-        capital: w.capital,
-        utilizationPct: w.utilizationPct,
-        otmGap: parseInt(w.otmGap || "0", 10),
-        wingGap: parseInt(w.wingGap || "0", 10),
-        entryTime: w.entryTime,
-        squareOffTime: w.squareOffTime,
-        legSlPct: w.legSlPct,
-        targetProfit: w.targetProfit ? parseFloat(w.targetProfit) : null,
-        startNow: w.startNow,
+      const n = w.instruments.length;
+      const per = Math.floor(w.capital / n / 1000) * 1000;
+      let deployed = 0;
+      for (let idx = 0; idx < n; idx++) {
+        const instId = w.instruments[idx];
+        const cap = idx === n - 1 ? Math.max(w.capital - per * (n - 1), 50000) : per;
+        await apiCall("/api/deployments", "POST", {
+          name: n > 1 ? `${instId} — ${w.name}` : w.name,
+          strategyType: strat.id,
+          instrument: instId,
+          expiryMode: calendar ? "NEAREST" : w.expiryMode,
+          direction: dirFixed !== "AUTO" ? dirFixed : "AUTO",
+          mode: w.mode,
+          capital: cap,
+          utilizationPct: w.utilizationPct,
+          otmGap: parseInt(w.otmGap || "0", 10),
+          wingGap: parseInt(w.wingGap || "0", 10),
+          entryTime: w.entryTime,
+          squareOffTime: w.squareOffTime,
+          legSlPct: w.legSlPct,
+          targetProfit: w.targetProfit && n === 1 ? parseFloat(w.targetProfit) : w.targetProfit ? parseFloat(w.targetProfit) / n : null,
+          startNow: w.startNow,
+        });
+        deployed++;
+      }
+      toast({
+        title: `${deployed} deployment${deployed === 1 ? "" : "s"} created`,
+        description: w.startNow ? "The engine will enter each at the configured time." : "Saved as stopped.",
       });
-      toast({ title: "Deployment created", description: w.startNow ? "The engine will enter at the configured time." : "Deployment saved as stopped." });
       closeWizard();
       setTab("deployments");
     } catch (e) {
@@ -185,6 +225,9 @@ export function DeployWizard() {
       setBusy(false);
     }
   };
+
+  const sizingEntries = w.instruments.map((i) => [i, sizingMap[i]] as const).filter(([, s]) => s !== undefined) as Array<[string, SizingData]>;
+  const totalMargin = sizingEntries.reduce((a, [, s]) => a + s.estTotalMargin, 0);
 
   return (
     <Dialog open={!!wizardStrategy} onOpenChange={(o) => !o && closeWizard()}>
@@ -221,28 +264,43 @@ export function DeployWizard() {
             </div>
 
             <div>
-              <Label className="mb-2 block">Index / Instrument (index options only)</Label>
+              <div className="mb-2 flex items-center justify-between">
+                <Label>Indices (multi-select — one deployment per index)</Label>
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Layers className="h-3.5 w-3.5" />{nIdx} selected
+                </span>
+              </div>
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 {["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"].map((k) => {
                   const disabled = !activeInstruments.includes(k);
                   const meta = INSTRUMENT_LIST.find((i) => i.id === k);
+                  const selected = w.instruments.includes(k);
                   return (
                     <button
                       key={k}
                       disabled={disabled}
-                      onClick={() => set("instrument", k)}
+                      onClick={() => toggleInstrument(k)}
+                      aria-pressed={selected}
                       className={cn(
                         "rounded-lg border p-3 text-left transition-colors",
-                        w.instrument === k ? "border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40" : "hover:bg-accent",
+                        selected ? "border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40" : "hover:bg-accent",
                         disabled && "cursor-not-allowed opacity-40",
                       )}
                     >
-                      <span className="block text-sm font-semibold">{k}</span>
+                      <span className="flex items-center justify-between">
+                        <span className="text-sm font-semibold">{k}</span>
+                        {selected && <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />}
+                      </span>
                       <span className="block text-xs text-muted-foreground">{meta ? `${meta.exchange} · lot ${meta.lotSize}` : "—"}{disabled ? " · off" : ""}</span>
                     </button>
                   );
                 })}
               </div>
+              {nIdx > 1 && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Capital of {inr(w.capital)} will split into {nIdx} × ~{inr(perIndexCapital)} and create {nIdx} independent deployments you can manage separately.
+                </p>
+              )}
             </div>
 
             {!calendar && (
@@ -267,6 +325,7 @@ export function DeployWizard() {
                     );
                   })}
                 </RadioGroup>
+                <p className="mt-1.5 text-xs text-muted-foreground">Applies to every selected index (each resolves its own expiry date).</p>
               </div>
             )}
 
@@ -292,7 +351,7 @@ export function DeployWizard() {
               {w.mode === "LIVE" && (
                 <p className="mt-2 flex items-start gap-1.5 text-xs text-amber-600 dark:text-amber-400">
                   <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  Live mode sends real market orders from your Shoonya account. Make sure API trading is enabled and funds are available.
+                  Live mode sends real market orders from your Shoonya account for every selected index. Make sure API trading is enabled and funds are available.
                 </p>
               )}
             </div>
@@ -304,10 +363,12 @@ export function DeployWizard() {
           <div className="space-y-5">
             <div className="grid gap-4 sm:grid-cols-2">
               <div>
-                <Label htmlFor="capital">Capital allocation (₹)</Label>
+                <Label htmlFor="capital">Capital allocation (₹, total)</Label>
                 <Input id="capital" type="number" min={50000} step={10000} value={w.capital}
                   onChange={(e) => set("capital", Number(e.target.value))} className="mt-1.5" />
-                <p className="mt-1 text-xs text-muted-foreground">Margin budget reserved for this deployment.</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Split across {nIdx} index{nIdx === 1 ? "" : "es"} — {inr(perIndexCapital)} each.
+                </p>
               </div>
               <div>
                 <Label htmlFor="util">Capital utilization — {w.utilizationPct}%</Label>
@@ -317,31 +378,37 @@ export function DeployWizard() {
               </div>
             </div>
 
-            {sizing && (
+            {sizingEntries.length > 0 && (
               <div className="rounded-lg border p-4">
                 <div className="mb-3 flex items-center justify-between">
-                  <span className="text-sm font-medium">Position sizing — % of capital</span>
-                  <Badge variant={sizing.sufficient ? "secondary" : "destructive"}>
-                    {sizing.sufficient ? `${sizing.lots} lot${sizing.lots === 1 ? "" : "s"}` : "insufficient capital"}
-                  </Badge>
+                  <span className="text-sm font-medium">Position sizing per index</span>
+                  <span className="text-xs text-muted-foreground">Est. total margin <span className="font-medium tabular-nums">{inr(totalMargin)}</span></span>
                 </div>
-                <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
-                  <div><span className="block text-xs text-muted-foreground">Simulated spot</span><span className="font-medium tabular-nums">{sizing.spot.toLocaleString("en-IN")}</span></div>
-                  <div><span className="block text-xs text-muted-foreground">ATM strike</span><span className="font-medium tabular-nums">{sizing.atm.toLocaleString("en-IN")}</span></div>
-                  <div><span className="block text-xs text-muted-foreground">Est. margin / lot</span><span className="font-medium tabular-nums">{inr(sizing.estMarginPerLot)}</span></div>
-                  <div><span className="block text-xs text-muted-foreground">Deployable</span><span className="font-medium tabular-nums">{inr(sizing.capitalDeployable)}</span></div>
-                  <div><span className="block text-xs text-muted-foreground">Est. total margin</span><span className="font-medium tabular-nums">{inr(sizing.estTotalMargin)}</span></div>
-                  <div><span className="block text-xs text-muted-foreground">Net premium / lot</span><span className="font-medium tabular-nums">{inr(sizing.estPremiumPerLot, { sign: true })}</span></div>
-                </div>
-                <Separator className="my-3" />
-                <p className="mb-1.5 text-xs font-medium text-muted-foreground">Legs at current simulated spot (indicative)</p>
-                <div className="space-y-1">
-                  {sizing.legsPreview.map((l) => (
-                    <div key={l.symbol} className="flex items-center justify-between font-mono text-xs">
-                      <span className={cn(l.side === "SELL" ? "text-rose-600 dark:text-rose-400" : "text-emerald-600 dark:text-emerald-400")}>
-                        {l.side} {l.symbol}
-                      </span>
-                      <span className="tabular-nums">₹{l.estPrice.toFixed(2)}</span>
+                <div className="space-y-3">
+                  {sizingEntries.map(([instId, s]) => (
+                    <div key={instId} className="rounded-lg border bg-zinc-50 p-3 dark:bg-zinc-900">
+                      <div className="mb-2 flex items-center justify-between">
+                        <Badge variant="secondary">{instId}</Badge>
+                        <Badge variant={s.sufficient ? "secondary" : "destructive"}>
+                          {s.sufficient ? `${s.lots} lot${s.lots === 1 ? "" : "s"}` : "insufficient capital"}
+                        </Badge>
+                      </div>
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs sm:grid-cols-4">
+                        <div><span className="block text-muted-foreground">Spot</span><span className="font-medium tabular-nums">{s.spot.toLocaleString("en-IN")}</span></div>
+                        <div><span className="block text-muted-foreground">ATM</span><span className="font-medium tabular-nums">{s.atm.toLocaleString("en-IN")}</span></div>
+                        <div><span className="block text-muted-foreground">Margin / lot</span><span className="font-medium tabular-nums">{inr(s.estMarginPerLot)}</span></div>
+                        <div><span className="block text-muted-foreground">Total margin</span><span className="font-medium tabular-nums">{inr(s.estTotalMargin)}</span></div>
+                      </div>
+                      <div className="mt-2 space-y-0.5">
+                        {s.legsPreview.map((l) => (
+                          <div key={l.symbol} className="flex items-center justify-between font-mono text-[11px]">
+                            <span className={cn(l.side === "SELL" ? "text-rose-600 dark:text-rose-400" : "text-emerald-600 dark:text-emerald-400")}>
+                              {l.side} {l.symbol}
+                            </span>
+                            <span className="tabular-nums">₹{l.estPrice.toFixed(2)}</span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -377,7 +444,9 @@ export function DeployWizard() {
                 <Label htmlFor="target">Target profit (₹, optional)</Label>
                 <Input id="target" type="number" min={0} step={500} placeholder="e.g. 8000" value={w.targetProfit}
                   onChange={(e) => set("targetProfit", e.target.value)} className="mt-1.5" />
-                <p className="mt-1 text-xs text-muted-foreground">Books the whole deployment when combined P&amp;L reaches this.</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Per deployment {nIdx > 1 ? `— split as ${inr((parseFloat(w.targetProfit) || 0) / nIdx)} per index` : "when combined P&L reaches this"}.
+                </p>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 {showOtmGap && (
@@ -412,20 +481,32 @@ export function DeployWizard() {
         {step === 3 && (
           <div className="space-y-5">
             <div>
-              <Label htmlFor="dname">Deployment name</Label>
+              <Label htmlFor="dname">Deployment name {nIdx > 1 && <span className="font-normal text-muted-foreground">(prefixed with each index)</span>}</Label>
               <Input id="dname" value={w.name} onChange={(e) => set("name", e.target.value)} className="mt-1.5" />
             </div>
+            {nIdx > 1 && (
+              <div className="rounded-lg border p-3">
+                <p className="mb-2 text-sm font-medium">Will create {nIdx} deployments</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {w.instruments.map((instId, i) => (
+                    <Badge key={instId} variant="secondary" className="text-xs">
+                      {instId} · {inr(i === nIdx - 1 ? Math.max(w.capital - Math.floor(w.capital / nIdx / 1000) * 1000 * (nIdx - 1), 50000) : Math.floor(w.capital / nIdx / 1000) * 1000)}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="rounded-lg border">
               {[
                 ["Strategy", strat.name],
-                ["Instrument", `${w.instrument} (index options · ${expiryInfo?.exchange ?? "—"})`],
+                ["Indices", w.instruments.join(" · ")],
                 ["Expiry", calendar ? "Nearest (sell) + Next (hedge)" : w.expiryMode === "NEAREST" ? `Nearest — ${expiryInfo?.nearest.label ?? ""}` : `Next — ${expiryInfo?.next.label ?? ""}`],
                 ["Mode", w.mode === "PAPER" ? "Paper trading" : "Live trading (Shoonya)"],
-                ["Lots", `${sizing?.lots ?? "—"} × ${expiryInfo?.lotSize ?? "—"} qty`],
-                ["Capital", `${inr(w.capital)} · ${w.utilizationPct}% utilized`],
+                ["Lots / index", sizingEntries.map(([id, s]) => `${id} ${s.lots}`).join(" · ") || "—"],
+                ["Capital", `${inr(w.capital)} total · ${w.utilizationPct}% utilized`],
                 ["Entry → Exit", `${w.entryTime} → ${w.squareOffTime} IST`],
                 ["Per-leg SL", `${w.legSlPct}% of leg premium`],
-                ["Target", w.targetProfit ? inr(parseFloat(w.targetProfit)) : "Disabled"],
+                ["Target", w.targetProfit ? `${inr(parseFloat(w.targetProfit))} total${nIdx > 1 ? ` (${inr(parseFloat(w.targetProfit) / nIdx)} per index)` : ""}` : "Disabled"],
                 ...(showOtmGap ? [["OTM gap", parseInt(w.otmGap || "0", 10) ? `${w.otmGap} pts` : "Auto (~0.4% of spot)"]] : []),
                 ...(showWingGap ? [["Wing gap", parseInt(w.wingGap || "0", 10) ? `${w.wingGap} pts` : "Auto (~0.6% of spot)"]] : []),
               ].map(([k, v], i) => (
@@ -453,7 +534,7 @@ export function DeployWizard() {
             <Button onClick={next}>Next <ChevronRight className="ml-1 h-4 w-4" /></Button>
           ) : (
             <Button onClick={deploy} disabled={busy} className="bg-emerald-600 hover:bg-emerald-700">
-              {busy ? "Deploying…" : (<><Check className="mr-1 h-4 w-4" />Deploy {w.mode === "LIVE" ? "LIVE" : "Paper"}</>)}
+              {busy ? "Deploying…" : (<><Check className="mr-1 h-4 w-4" />Deploy {nIdx > 1 ? `${nIdx} deployments` : w.mode === "LIVE" ? "LIVE" : "Paper"}</>)}
             </Button>
           )}
         </DialogFooter>

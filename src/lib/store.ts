@@ -2,7 +2,7 @@
 
 import { create } from "zustand";
 
-export type TabId = "dashboard" | "strategies" | "deployments" | "orders" | "settings";
+export type TabId = "dashboard" | "strategies" | "backtest" | "scanner" | "deployments" | "orders" | "settings";
 
 interface AppState {
   tab: TabId;
