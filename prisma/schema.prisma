@@ -1,0 +1,116 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Shoonya broker credentials + live session (stored locally on this machine only)
+model BrokerAccount {
+  id             String    @id @default("shoonya")
+  userId         String?
+  password       String?
+  factor2        String? // PAN / 2FA factor
+  vendorCode     String?
+  apiKey         String? // app_idkey
+  imei           String?
+  totpSecret     String? // optional TOTP secret for automated 2FA
+  sessionToken   String?
+  sessionExpires DateTime?
+  lastLoginAt    DateTime?
+  lastStatus     String    @default("NOT_CONFIGURED") // NOT_CONFIGURED | CONNECTED | ERROR
+  lastError      String?
+  accountId      String?
+  updatedAt      DateTime  @updatedAt
+}
+
+model Settings {
+  id               String   @id @default("global")
+  dayMaxLoss       Float    @default(10000)
+  paperCapital     Float    @default(1000000)
+  defaultSquareOff String   @default("15:15")
+  activeInstruments String  @default("NIFTY,BANKNIFTY,FINNIFTY,MIDCPNIFTY,SENSEX,BANKEX")
+  paperSimulate    Boolean  @default(true)
+  updatedAt        DateTime @updatedAt
+}
+
+model Deployment {
+  id             String    @id @default(cuid())
+  name           String
+  strategyType   String // SHORT_STRADDLE_920 | SHORT_STRANGLE | IRON_CONDOR | BULL_CALL_SPREAD | BEAR_PUT_SPREAD | LONG_CALL | LONG_PUT | ORB_DIRECTIONAL | MOMENTUM_BUY | SHORT_CALENDAR_STRADDLE
+  instrument     String // NIFTY | BANKNIFTY | FINNIFTY | MIDCPNIFTY | SENSEX | BANKEX
+  expiryMode     String    @default("NEAREST") // NEAREST | NEXT
+  expiryDate     String? // ISO yyyy-mm-dd resolved at entry
+  direction      String    @default("AUTO") // AUTO | BULLISH | BEARISH
+  mode           String    @default("PAPER") // PAPER | LIVE
+  capital        Float
+  utilizationPct Float     @default(100)
+  lots           Int       @default(1)
+  otmGap         Int       @default(0) // points, 0 = auto
+  wingGap        Int       @default(0) // points, 0 = auto
+  entryTime      String    @default("09:20") // IST hh:mm
+  squareOffTime  String    @default("15:15")
+  legSlPct       Float     @default(50) // stop-loss as % adverse move on leg premium
+  targetProfit   Float? // ₹ target on total deployment P&L, null = disabled
+  status         String    @default("STOPPED") // RUNNING | PAUSED | STOPPED | COMPLETED | KILLED | ERROR
+  statusNote     String?
+  startedAt      DateTime?
+  stoppedAt      DateTime?
+  realizedPnl    Float     @default(0)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  legs           Leg[]
+  orders         Order[]
+  events         Event[]
+}
+
+model Leg {
+  id           String    @id @default(cuid())
+  deploymentId String
+  deployment   Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  symbol       String
+  exchange     String // NFO | BFO
+  strike       Float
+  optionType   String // CE | PE
+  side         String // BUY | SELL
+  lotSize      Int
+  qty          Int
+  expiryDate   String?
+  entryPrice   Float?
+  exitPrice    Float?
+  ltp          Float?
+  slPrice      Float?
+  status       String    @default("PENDING") // PENDING | OPEN | CLOSED_SL | CLOSED_TARGET | CLOSED_MANUAL | CLOSED_TIME | REJECTED
+  openedAt     DateTime?
+  closedAt     DateTime?
+  realizedPnl  Float     @default(0)
+}
+
+model Order {
+  id            String    @id @default(cuid())
+  deploymentId  String?
+  deployment    Deployment? @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  tsym          String
+  exchange      String
+  side          String // B | S
+  qty           Int
+  price         Float
+  priceType     String    @default("MKT")
+  mode          String // PAPER | LIVE
+  status        String // FILLED | REJECTED | SENT
+  brokerOrderId String?
+  message       String?
+  createdAt     DateTime  @default(now())
+}
+
+model Event {
+  id           String    @id @default(cuid())
+  deploymentId String?
+  deployment   Deployment? @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  level        String    @default("INFO") // INFO | WARN | ERROR | TRADE
+  type         String // STARTED | STOPPED | ENTRY_FILLED | LEG_SL | TARGET_HIT | KILL_SWITCH | SQUARE_OFF | ERROR | BROKER
+  message      String
+  createdAt    DateTime  @default(now())
+}
