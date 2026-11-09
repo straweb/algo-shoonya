@@ -1,0 +1,924 @@
+     1→     1→// Market scanner engine.
+     2→     2→// A singleton 5s loop that:
+     3→     3→//  - walks simulated prices for the 6 indices + NSE F&O stock universe (paper)
+     4→     4→//  - pulls real quotes via Shoonya when a LIVE scanner is enabled
+     5→     5→//  - builds rolling candles and evaluates spot price-action patterns:
+     6→     6→//      LIQUIDITY_SWEEP · ORDER_BLOCK · HEAD_SHOULDERS · DOUBLE_BOTTOM · DOUBLE_TOP
+     7→     7→//    plus tick-level ORB and MOMENTUM
+     8→     8→//  - every signal carries explicit entry / SL / target levels on the spot price
+     9→     9→//  - optionally auto-places: equity market orders for stocks, ATM option
+    10→    10→//    (CE on LONG / PE on SHORT) for indices, then manages SL / target /
+    11→    11→//    timed square-off and premium P&L for index trades
+    12→    12→
+    13→    13→import { db } from "@/lib/db";
+    14→    14→import { SCAN_ASSETS, SCAN_ASSET_MAP, getScanAsset, type ScanAsset } from "./stocks";
+    15→    15→import { gaussian, roundTick, paperPremium } from "./pricing";
+    16→    16→import { istNow, isMarketOpen, hhmmToMinutes } from "./market";
+    17→    17→import { shoonyaLogin, shoonyaQuote, shoonyaPlaceOrder, ShoonyaCreds } from "./shoonya";
+    18→    18→import {
+    19→    19→  INSTRUMENTS,
+    20→    20→  optionSymbol,
+    21→    21→  resolveExpiry,
+    22→    22→  roundStrike,
+    23→    23→  type InstrumentId,
+    24→    24→} from "./instruments";
+    25→    25→import {
+    26→    26→  PATTERN_DEFS,
+    27→    27→  runPatternDetectors,
+    28→    28→  validStrategyIds,
+    29→    29→  type Candle,
+    30→    30→  type PatternId,
+    31→    31→} from "./patterns";
+    32→    32→
+    33→    33→const SCAN_TICK_MS = 5000;
+    34→    34→const SLIPPAGE = 0.0005; // 0.05% adverse paper fill on cash entries
+    35→    35→const ORB_TICKS = 15; // ticks forming the opening range (~75s in sim)
+    36→    36→const MOMENTUM_WARMUP_TICKS = 10;
+    37→    37→const MOMENTUM_THRESHOLD = 0.005; // 0.5% move from day open
+    38→    38→const ERROR_THROTTLE_MS = 5 * 60 * 1000;
+    39→    39→const MAX_CANDLES = 320;
+    40→    40→const BACKFILL_BARS = 150; // paper-mode seeded history so patterns can fire immediately
+    41→    41→const MS_PER_YEAR = 365 * 24 * 3600 * 1000;
+    42→    42→
+    43→    43→interface CandleState {
+    44→    44→  t: number;
+    45→    45→  o: number;
+    46→    46→  h: number;
+    47→    47→  l: number;
+    48→    48→  c: number;
+    49→    49→  n: number;
+    50→    50→}
+    51→    51→
+    52→    52→interface ScannerState {
+    53→    53→  prices: Map<string, number>;
+    54→    54→  dayOpen: Map<string, number>;
+    55→    55→  orbHigh: Map<string, number>;
+    56→    56→  orbLow: Map<string, number>;
+    57→    57→  orbTicks: Map<string, number>;
+    58→    58→  candles: Map<string, Candle[]>;
+    59→    59→  cur: Map<string, CandleState>;
+    60→    60→  backfilled: Set<string>;
+    61→    61→  day: string;
+    62→    62→  cooldown: Set<string>; // `${symbol}` signaled today
+    63→    63→  lastErrorAt: number;
+    64→    64→  ticking: boolean;
+    65→    65→  session: { token: string; actid: string; userId: string } | null;
+    66→    66→}
+    67→    67→
+    68→    68→const g = globalThis as unknown as { __shoonyaAlgoScanner?: Scanner };
+    69→    69→
+    70→    70→const SCANNER_VERSION = 3;
+    71→    71→
+    72→    72→export interface ScannerUniverseRow {
+    73→    73→  symbol: string;
+    74→    74→  name: string;
+    75→    75→  kind: "INDEX" | "EQUITY";
+    76→    76→  price: number;
+    77→    77→  dayOpen: number;
+    78→    78→  chgPct: number;
+    79→    79→  orbHigh: number | null;
+    80→    80→  orbLow: number | null;
+    81→    81→  rangeReady: boolean;
+    82→    82→  bars: number;
+    83→    83→  enabled: boolean;
+    84→    84→  state: "SCANNING" | "IN_TRADE" | "COOLDOWN" | "IDLE";
+    85→    85→}
+    86→    86→
+    87→    87→export interface ScanTradeSpec {
+    88→    88→  strategy: string;
+    89→    89→  side: "LONG" | "SHORT";
+    90→    90→  entry: number; // spot level entry
+    91→    91→  sl: number; // spot level SL
+    92→    92→  target: number; // spot level target
+    93→    93→  ref: number; // structural reference level
+    94→    94→  note: string;
+    95→    95→}
+    96→    96→
+    97→    97→function round2(x: number): number {
+    98→    98→  return Math.round(x * 100) / 100;
+    99→    99→}
+   100→   100→
+   101→   101→/** Parse a scanner-executed option tradingsymbol back into its parts. */
+   102→   102→function parseExecSymbol(tsym: string):
+   103→   103→  | { instId: InstrumentId; strike: number; type: "CE" | "PE"; settleMs: number }
+   104→   104→  | null {
+   105→   105→  const m = tsym.match(/^(NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY|SENSEX|BANKEX)(\d{2})([A-Z]{3})(\d{2})(\d+)(CE|PE)$/);
+   106→   106→  if (!m) return null;
+   107→   107→  const months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+   108→   108→  const mi = months.indexOf(m[3]);
+   109→   109→  if (mi < 0) return null;
+   110→   110→  const settleMs = Date.UTC(2000 + parseInt(m[4], 10), mi, parseInt(m[2], 10), 10, 0, 0);
+   111→   111→  return {
+   112→   112→    instId: m[1] as InstrumentId,
+   113→   113→    strike: parseFloat(m[5]),
+   114→   114→    type: m[6] as "CE" | "PE",
+   115→   115→    settleMs,
+   116→   116→  };
+   117→   117→}
+   118→   118→
+   119→   119→class Scanner {
+   120→   120→  readonly codeVersion = SCANNER_VERSION;
+   121→   121→  private state: ScannerState = {
+   122→   122→    prices: new Map(),
+   123→   123→    dayOpen: new Map(),
+   124→   124→    orbHigh: new Map(),
+   125→   125→    orbLow: new Map(),
+   126→   126→    orbTicks: new Map(),
+   127→   127→    candles: new Map(),
+   128→   128→    cur: new Map(),
+   129→   129→    backfilled: new Set(),
+   130→   130→    day: "",
+   131→   131→    cooldown: new Set(),
+   132→   132→    lastErrorAt: 0,
+   133→   133→    ticking: false,
+   134→   134→    session: null,
+   135→   135→  };
+   136→   136→  private timer: ReturnType<typeof setInterval> | null = null;
+   137→   137→
+   138→   138→  start() {
+   139→   139→    if (this.timer) return;
+   140→   140→    for (const a of SCAN_ASSETS) this.state.prices.set(a.symbol, a.basePrice);
+   141→   141→    console.log(`[scanner] started v${this.codeVersion} (${SCAN_ASSETS.length} symbols incl. indices)`);
+   142→   142→    this.timer = setInterval(() => {
+   143→   143→      this.tick().catch((e) => console.error("[scanner] tick error:", e));
+   144→   144→    }, SCAN_TICK_MS);
+   145→   145→  }
+   146→   146→
+   147→   147→  stop() {
+   148→   148→    if (this.timer) {
+   149→   149→      clearInterval(this.timer);
+   150→   150→      this.timer = null;
+   151→   151→    }
+   152→   152→  }
+   153→   153→
+   154→   154→  price(symbol: string): number {
+   155→   155→    return this.state.prices.get(symbol) ?? SCAN_ASSET_MAP[symbol]?.basePrice ?? 0;
+   156→   156→  }
+   157→   157→
+   158→   158→  private rollDay(day: string) {
+   159→   159→    if (this.state.day !== day) {
+   160→   160→      this.state.day = day;
+   161→   161→      this.state.dayOpen.clear();
+   162→   162→      this.state.orbHigh.clear();
+   163→   163→      this.state.orbLow.clear();
+   164→   164→      this.state.orbTicks.clear();
+   165→   165→      this.state.cooldown.clear();
+   166→   166→      this.state.candles.clear();
+   167→   167→      this.state.cur.clear();
+   168→   168→      this.state.backfilled.clear();
+   169→   169→    }
+   170→   170→  }
+   171→   171→
+   172→   172→  private walk() {
+   173→   173→    for (const a of SCAN_ASSETS) {
+   174→   174→      const p = this.state.prices.get(a.symbol) ?? a.basePrice;
+   175→   175→      // ~0.08% of price per 5s tick scaled by each symbol's vol -> candles move
+   176→   176→      const next = p + (a.basePrice - p) * 0.0004 + p * a.vol * 0.0035 * gaussian();
+   177→   177→      const snapped = round2(next);
+   178→   178→      this.state.prices.set(a.symbol, snapped);
+   179→   179→      if (!this.state.dayOpen.has(a.symbol)) this.state.dayOpen.set(a.symbol, snapped);
+   180→   180→    }
+   181→   181→  }
+   182→   182→
+   183→   183→  // ---------- candles ----------
+   184→   184→
+   185→   185→  /** Seed paper candle history (bridged random walk ending at the current price). */
+   186→   186→  private backfill(sym: string, asset: ScanAsset, candleSec: number) {
+   187→   187→    const key = `${sym}:${candleSec}`;
+   188→   188→    if (this.state.backfilled.has(key)) return;
+   189→   189→    this.state.backfilled.add(key);
+   190→   190→    const price = this.price(sym) || asset.basePrice;
+   191→   191→    const sigma = (price * asset.vol) / Math.sqrt(252 * 375) * Math.sqrt(candleSec / 60);
+   192→   192→    const steps: number[] = [0];
+   193→   193→    let cum = 0;
+   194→   194→    for (let i = 1; i <= BACKFILL_BARS; i++) {
+   195→   195→      cum += gaussian();
+   196→   196→      steps.push(cum);
+   197→   197→    }
+   198→   198→    const rawN = steps[BACKFILL_BARS];
+   199→   199→    const candles: Candle[] = [];
+   200→   200→    const nowMs = Date.now();
+   201→   201→    const grid = Math.floor(nowMs / (candleSec * 1000)) * candleSec * 1000;
+   202→   202→    let prev = price; // bridged series ends exactly at the current price
+   203→   203→    for (let i = 1; i <= BACKFILL_BARS; i++) {
+   204→   204→      const c = price + (steps[i] - (i / BACKFILL_BARS) * rawN) * sigma;
+   205→   205→      const o = prev;
+   206→   206→      const wickUp = Math.abs(gaussian()) * sigma * 0.5;
+   207→   207→      const wickDn = Math.abs(gaussian()) * sigma * 0.5;
+   208→   208→      candles.push({
+   209→   209→        t: grid - (BACKFILL_BARS - i) * candleSec * 1000,
+   210→   210→        o: round2(o),
+   211→   211→        h: round2(Math.max(o, c) + wickUp),
+   212→   212→        l: round2(Math.min(o, c) - wickDn),
+   213→   213→        c: round2(c),
+   214→   214→      });
+   215→   215→      prev = c;
+   216→   216→    }
+   217→   217→    this.state.candles.set(sym, candles);
+   218→   218→  }
+   219→   219→
+   220→   220→  /** Append a price tick to the in-progress candle; returns true when a candle just closed. */
+   221→   221→  private appendTick(sym: string, price: number, candleSec: number): boolean {
+   222→   222→    const nowMs = Date.now();
+   223→   223→    const start = Math.floor(nowMs / (candleSec * 1000)) * candleSec * 1000;
+   224→   224→    const cur = this.state.cur.get(sym);
+   225→   225→    if (!cur || cur.t !== start) {
+   226→   226→      if (cur && cur.n > 0) {
+   227→   227→        const arr = this.state.candles.get(sym) ?? [];
+   228→   228→        arr.push({ t: cur.t, o: cur.o, h: cur.h, l: cur.l, c: cur.c });
+   229→   229→        if (arr.length > MAX_CANDLES) arr.splice(0, arr.length - MAX_CANDLES);
+   230→   230→        this.state.candles.set(sym, arr);
+   231→   231→        this.state.cur.delete(sym);
+   232→   232→        // start the new candle
+   233→   233→        this.state.cur.set(sym, { t: start, o: price, h: price, l: price, c: price, n: 1 });
+   234→   234→        return true;
+   235→   235→      }
+   236→   236→      this.state.cur.set(sym, { t: start, o: price, h: price, l: price, c: price, n: 1 });
+   237→   237→      return false;
+   238→   238→    }
+   239→   239→    cur.h = Math.max(cur.h, price);
+   240→   240→    cur.l = Math.min(cur.l, price);
+   241→   241→    cur.c = price;
+   242→   242→    cur.n++;
+   243→   243→    return false;
+   244→   244→  }
+   245→   245→
+   246→   246→  // ---------- live quotes ----------
+   247→   247→  private async ensureSession(): Promise<boolean> {
+   248→   248→    if (this.state.session) return true;
+   249→   249→    const acct = await db.brokerAccount.findUnique({ where: { id: "shoonya" } });
+   250→   250→    if (!acct || !acct.userId || !acct.password || !acct.apiKey) return false;
+   251→   251→    const creds: ShoonyaCreds = {
+   252→   252→      userId: acct.userId,
+   253→   253→      password: acct.password,
+   254→   254→      factor2: acct.factor2 ?? "",
+   255→   255→      vendorCode: acct.vendorCode ?? "",
+   256→   256→      apiKey: acct.apiKey,
+   257→   257→      imei: acct.imei ?? "shoonyaalgo",
+   258→   258→      totpSecret: acct.totpSecret,
+   259→   259→    };
+   260→   260→    const res = await shoonyaLogin(creds);
+   261→   261→    if (res.ok && res.token) {
+   262→   262→      this.state.session = { token: res.token, actid: res.account ?? acct.userId, userId: acct.userId };
+   263→   263→      return true;
+   264→   264→    }
+   265→   265→    return false;
+   266→   266→  }
+   267→   267→
+   268→   268→  private throttleError(message: string) {
+   269→   269→    const now = Date.now();
+   270→   270→    if (now - this.state.lastErrorAt < ERROR_THROTTLE_MS) return;
+   271→   271→    this.state.lastErrorAt = now;
+   272→   272→    void db.event
+   273→   273→      .create({ data: { deploymentId: null, type: "ERROR", message, level: "ERROR" } })
+   274→   274→      .catch(() => {});
+   275→   275→  }
+   276→   276→
+   277→   277→  // ---------- index option helpers ----------
+   278→   278→
+   279→   279→  /** ATM option chosen for a directional index trade (CE on LONG, PE on SHORT). */
+   280→   280→  private indexExecution(
+   281→   281→    instId: InstrumentId,
+   282→   282→    spot: number,
+   283→   283→    side: "LONG" | "SHORT",
+   284→   284→    now: Date,
+   285→   285→  ): { execSymbol: string; exchange: "NFO" | "BFO"; execQty: number; strike: number; type: "CE" | "PE"; settleMs: number; lotSize: number; iv: number } | null {
+   286→   286→    const inst = INSTRUMENTS[instId];
+   287→   287→    if (!inst) return null;
+   288→   288→    const expiry = resolveExpiry(inst, "NEAREST", now).date;
+   289→   289→    const settleMs = Date.UTC(expiry.getUTCFullYear(), expiry.getUTCMonth(), expiry.getUTCDate(), 10, 0, 0);
+   290→   290→    const strike = roundStrike(spot, inst.strikeStep);
+   291→   291→    const type = side === "LONG" ? "CE" : "PE";
+   292→   292→    return {
+   293→   293→      execSymbol: optionSymbol(inst, expiry, strike, type),
+   294→   294→      exchange: inst.exchange,
+   295→   295→      execQty: inst.lotSize, // 1 lot; sized up below if capital allows
+   296→   296→      strike,
+   297→   297→      type,
+   298→   298→      settleMs,
+   299→   299→      lotSize: inst.lotSize,
+   300→   300→      iv: inst.iv,
+   301→   301→    };
+   302→   302→  }
+   303→   303→
+   304→   304→  private bsPremiumFor(exec: NonNullable<ReturnType<Scanner["indexExecution"]>>, spot: number): number {
+   305→   305→    const T = Math.max((exec.settleMs - Date.now()) / MS_PER_YEAR, 0);
+   306→   306→    return roundTick(paperPremium({ spot, strike: exec.strike, iv: exec.iv, yearsToExpiry: T, type: exec.type }));
+   307→   307→  }
+   308→   308→
+   309→   309→  // ---------- main tick ----------
+   310→   310→  async tick(): Promise<void> {
+   311→   311→    if (this.state.ticking) return;
+   312→   312→    this.state.ticking = true;
+   313→   313→    try {
+   314→   314→      const now = istNow();
+   315→   315→      this.rollDay(`${now.yyyy}-${now.mm}-${now.dd}`);
+   316→   316→      const marketOpen = isMarketOpen(now);
+   317→   317→
+   318→   318→      const config = await db.scannerConfig.findUnique({ where: { id: "global" } });
+   319→   319→      if (!config) return;
+   320→   320→
+   321→   321→      const enabledSymbols = config.symbols
+   322→   322→        .split(",")
+   323→   323→        .map((s) => s.trim().toUpperCase())
+   324→   324→        .filter((s) => SCAN_ASSET_MAP[s] !== undefined);
+   325→   325→
+   326→   326→      const live = config.mode === "LIVE";
+   327→   327→      const candleSec = Math.max(15, Math.min(300, config.candleSeconds || 60));
+   328→   328→
+   329→   329→      // ---------- price source ----------
+   330→   330→      if (live && enabledSymbols.length > 0) {
+   331→   331→        const ok = await this.ensureSession();
+   332→   332→        if (!ok) {
+   333→   333→          this.throttleError("Scanner LIVE mode: no broker session — quotes unavailable. Configure Shoonya credentials in Settings.");
+   334→   334→          return;
+   335→   335→        }
+   336→   336→        const results = await Promise.all(
+   337→   337→          enabledSymbols.map(async (sym) => {
+   338→   338→            const asset = SCAN_ASSET_MAP[sym];
+   339→   339→            const lp =
+   340→   340→              asset?.kind === "INDEX"
+   341→   341→                ? await shoonyaQuote(this.state.session!.token, this.state.session!.userId, asset.exchange ?? "NFO", sym)
+   342→   342→                : await shoonyaQuote(this.state.session!.token, this.state.session!.userId, "NSE", `${sym}-EQ`);
+   343→   343→            return [sym, lp] as const;
+   344→   344→          }),
+   345→   345→        );
+   346→   346→        let anyQuote = false;
+   347→   347→        for (const [sym, lp] of results) {
+   348→   348→          if (lp !== null && lp > 0) {
+   349→   349→            this.state.prices.set(sym, lp);
+   350→   350→            if (!this.state.dayOpen.has(sym)) this.state.dayOpen.set(sym, lp);
+   351→   351→            anyQuote = true;
+   352→   352→          }
+   353→   353→        }
+   354→   354→        if (!anyQuote) {
+   355→   355→          this.throttleError("Scanner LIVE mode: quotes unreachable from this machine. Check network / broker session.");
+   356→   356→          return;
+   357→   357→        }
+   358→   358→      } else {
+   359→   359→        // paper (and pre-warm of sim sessions): walk simulated prices
+   360→   360→        this.walk();
+   361→   361→      }
+   362→   362→
+   363→   363→      if (!config.enabled || enabledSymbols.length === 0) return;
+   364→   364→
+   365→   365→      // ---------- manage open scan trades ----------
+   366→   366→      await this.manageOpenTrades(config, now, marketOpen);
+   367→   367→
+   368→   368→      // ---------- candle building ----------
+   369→   369→      const freshlyClosed = new Set<string>();
+   370→   370→      for (const sym of enabledSymbols) {
+   371→   371→        const asset = SCAN_ASSET_MAP[sym];
+   372→   372→        if (!asset) continue;
+   373→   373→        const price = this.price(sym);
+   374→   374→        if (!price) continue;
+   375→   375→        if (!live) this.backfill(sym, asset, candleSec);
+   376→   376→        if (this.appendTick(sym, price, candleSec)) freshlyClosed.add(sym);
+   377→   377→      }
+   378→   378→
+   379→   379→      // ---------- evaluate signals ----------
+   380→   380→      const openTrades = await db.scanTrade.findMany({ where: { status: "OPEN" } });
+   381→   381→      const inTrade = new Set(openTrades.map((t) => t.symbol));
+   382→   382→
+   383→   383→      let strategies: string[] = [];
+   384→   384→      try {
+   385→   385→        const parsed = JSON.parse(config.strategies) as unknown;
+   386→   386→        if (Array.isArray(parsed)) strategies = parsed.filter((s) => validStrategyIds().includes(String(s)));
+   387→   387→      } catch {
+   388→   388→        strategies = ["ORB"];
+   389→   389→      }
+   390→   390→      if (config.strategy === "MOMENTUM" && strategies.length === 1 && strategies[0] === "ORB") strategies = ["MOMENTUM"];
+   391→   391→      const patternIds = strategies.filter((s) => !["ORB", "MOMENTUM"].includes(s)) as PatternId[];
+   392→   392→      let overrides: Record<string, Record<string, number>> = {};
+   393→   393→      try {
+   394→   394→        overrides = JSON.parse(config.patternParams) as typeof overrides;
+   395→   395→      } catch {
+   396→   396→        overrides = {};
+   397→   397→      }
+   398→   398→
+   399→   399→      for (const sym of enabledSymbols) {
+   400→   400→        const asset = getScanAsset(sym);
+   401→   401→        if (!asset) continue;
+   402→   402→        const price = this.price(sym);
+   403→   403→        const open = this.state.dayOpen.get(sym);
+   404→   404→        if (!open) continue;
+   405→   405→
+   406→   406→        // opening-range bookkeeping (ORB / momentum use tick ranges)
+   407→   407→        const t = (this.state.orbTicks.get(sym) ?? 0) + 1;
+   408→   408→        this.state.orbTicks.set(sym, t);
+   409→   409→        if (t <= ORB_TICKS) {
+   410→   410→          this.state.orbHigh.set(sym, Math.max(this.state.orbHigh.get(sym) ?? price, price));
+   411→   411→          this.state.orbLow.set(sym, Math.min(this.state.orbLow.get(sym) ?? price, price));
+   412→   412→        }
+   413→   413→
+   414→   414→        if (this.state.cooldown.has(sym) || inTrade.has(sym)) continue;
+   415→   415→
+   416→   416→        // ----- pattern signals (candle based) -----
+   417→   417→        if (patternIds.length > 0 && freshlyClosed.has(sym)) {
+   418→   418→          const candles = this.state.candles.get(sym) ?? [];
+   419→   419→          const sigs = runPatternDetectors(candles, patternIds, overrides);
+   420→   420→          if (sigs.length > 0) {
+   421→   421→            const s = sigs[0];
+   422→   422→            await this.fireSignal(config, asset, sym, {
+   423→   423→              strategy: s.strategy,
+   424→   424→              side: s.side,
+   425→   425→              entry: round2(s.entry),
+   426→   426→              sl: round2(s.sl),
+   427→   427→              target: round2(s.target),
+   428→   428→              ref: round2(s.ref),
+   429→   429→              note: s.note,
+   430→   430→            });
+   431→   431→            continue;
+   432→   432→          }
+   433→   433→        }
+   434→   434→
+   435→   435→        // ----- base strategies (tick based) -----
+   436→   436→        let spec: ScanTradeSpec | null = null;
+   437→   437→        if (strategies.includes("ORB")) {
+   438→   438→          if (t > ORB_TICKS) {
+   439→   439→            const hi = this.state.orbHigh.get(sym);
+   440→   440→            const lo = this.state.orbLow.get(sym);
+   441→   441→            if (hi && lo) {
+   442→   442→              const b = round2(price * 0.0005);
+   443→   443→              if (price > hi + b) {
+   444→   444→                spec = {
+   445→   445→                  strategy: "ORB",
+   446→   446→                  side: "LONG",
+   447→   447→                  entry: round2(price),
+   448→   448→                  sl: round2(price * (1 - config.slPct / 100)),
+   449→   449→                  target: round2(price * (1 + config.targetPct / 100)),
+   450→   450→                  ref: round2(hi),
+   451→   451→                  note: `Broke above opening range high ₹${hi.toFixed(2)} (range ₹${lo.toFixed(2)}–₹${hi.toFixed(2)}).`,
+   452→   452→                };
+   453→   453→              } else if (price < lo - b) {
+   454→   454→                spec = {
+   455→   455→                  strategy: "ORB",
+   456→   456→                  side: "SHORT",
+   457→   457→                  entry: round2(price),
+   458→   458→                  sl: round2(price * (1 + config.slPct / 100)),
+   459→   459→                  target: round2(price * (1 - config.targetPct / 100)),
+   460→   460→                  ref: round2(lo),
+   461→   461→                  note: `Broke below opening range low ₹${lo.toFixed(2)} (range ₹${lo.toFixed(2)}–₹${hi.toFixed(2)}).`,
+   462→   462→                };
+   463→   463→              }
+   464→   464→            }
+   465→   465→          }
+   466→   466→        } else if (strategies.includes("MOMENTUM") && spec === null) {
+   467→   467→          if (t > MOMENTUM_WARMUP_TICKS) {
+   468→   468→            const chg = price / open - 1;
+   469→   469→            if (chg >= MOMENTUM_THRESHOLD) {
+   470→   470→              spec = {
+   471→   471→                strategy: "MOMENTUM",
+   472→   472→                side: "LONG",
+   473→   473→                entry: round2(price),
+   474→   474→                sl: round2(price * (1 - config.slPct / 100)),
+   475→   475→                target: round2(price * (1 + config.targetPct / 100)),
+   476→   476→                ref: round2(open),
+   477→   477→                note: `Up ${((price / open - 1) * 100).toFixed(2)}% from day open — momentum continuation.`,
+   478→   478→              };
+   479→   479→            } else if (chg <= -MOMENTUM_THRESHOLD) {
+   480→   480→              spec = {
+   481→   481→                strategy: "MOMENTUM",
+   482→   482→                side: "SHORT",
+   483→   483→                entry: round2(price),
+   484→   484→                sl: round2(price * (1 + config.slPct / 100)),
+   485→   485→                target: round2(price * (1 - config.targetPct / 100)),
+   486→   486→                ref: round2(open),
+   487→   487→                note: `Down ${(Math.abs(chg) * 100).toFixed(2)}% from day open — momentum breakdown.`,
+   488→   488→              };
+   489→   489→            }
+   490→   490→          }
+   491→   491→        }
+   492→   492→        if (spec) await this.fireSignal(config, asset, sym, spec);
+   493→   493→      }
+   494→   494→    } finally {
+   495→   495→      this.state.ticking = false;
+   496→   496→    }
+   497→   497→  }
+   498→   498→
+   499→   499→  /** Record a signal and (optionally) place the trade with explicit spot levels. */
+   500→   500→  private async fireSignal(
+   501→   501→    config: {
+   502→   502→      autoPlace: boolean;
+   503→   503→      mode: string;
+   504→   504→      capitalPerTrade: number;
+   505→   505→    },
+   506→   506→    asset: ScanAsset,
+   507→   507→    sym: string,
+   508→   508→    spec: ScanTradeSpec,
+   509→   509→  ) {
+   510→   510→    this.state.cooldown.add(sym);
+   511→   511→    let placed = false;
+   512→   512→    let tradeId: string | null = null;
+   513→   513→
+   514→   514→    if (config.autoPlace) placed = true; // set false again if execution fails outright
+   515→   515→
+   516→   516→    let tradeRow: { id: string } | null = null;
+   517→   517→    if (config.autoPlace) {
+   518→   518→      try {
+   519→   519→        tradeRow = await this.openScanTrade(config, asset, sym, spec);
+   520→   520→        tradeId = tradeRow?.id ?? null;
+   521→   521→        placed = tradeRow !== null;
+   522→   522→      } catch (e) {
+   523→   523→        console.error("[scanner] trade placement failed:", e);
+   524→   524→        placed = false;
+   525→   525→      }
+   526→   526→    }
+   527→   527→
+   528→   528→    await db.scanSignal.create({
+   529→   529→      data: {
+   530→   530→        symbol: sym,
+   531→   531→        strategy: spec.strategy,
+   532→   532→        side: spec.side,
+   533→   533→        refPrice: spec.ref,
+   534→   534→        price: spec.entry,
+   535→   535→        entryLevel: spec.entry,
+   536→   536→        slLevel: spec.sl,
+   537→   537→        targetLevel: spec.target,
+   538→   538→        note: spec.note,
+   539→   539→        placed,
+   540→   540→        tradeId,
+   541→   541→      },
+   542→   542→    });
+   543→   543→  }
+   544→   544→
+   545→   545→  /** Create the ScanTrade (equity cash or index ATM option) for a signal. */
+   546→   546→  private async openScanTrade(
+   547→   547→    config: { mode: string; capitalPerTrade: number },
+   548→   548→    asset: ScanAsset,
+   549→   549→    sym: string,
+   550→   550→    spec: ScanTradeSpec,
+   551→   551→  ): Promise<{ id: string } | null> {
+   552→   552→    const now = new Date();
+   553→   553→    let qty = 0;
+   554→   554→    let execSymbol: string | null = null;
+   555→   555→    let execQty = 0;
+   556→   556→    let entryPremium: number | null = null;
+   557→   557→    let orderTsyl = `${sym}-EQ`;
+   558→   558→    let orderExchange = "NSE";
+   559→   559→    let orderPrice = spec.entry;
+   560→   560→    let execDesc = `${sym} × qty`;
+   561→   561→
+   562→   562→    if (asset.kind === "INDEX") {
+   563→   563→      const instId = sym as InstrumentId;
+   564→   564→      const exec = this.indexExecution(instId, spec.entry, spec.side, now);
+   565→   565→      if (!exec) return null;
+   566→   566→      const est = this.bsPremiumFor(exec, spec.entry);
+   567→   567→      // live: prefer the real option LTP when available
+   568→   568→      let premium = est;
+   569→   569→      if (config.mode === "LIVE" && this.state.session) {
+   570→   570→        const lp = await shoonyaQuote(this.state.session.token, this.state.session.userId, exec.exchange, exec.execSymbol).catch(() => null);
+   571→   571→        if (lp && lp > 0) premium = lp;
+   572→   572→      }
+   573→   573→      const lots = Math.max(1, Math.floor(config.capitalPerTrade / Math.max(1, premium * exec.lotSize)));
+   574→   574→      execQty = lots * exec.lotSize;
+   575→   575→      execSymbol = exec.execSymbol;
+   576→   576→      entryPremium = premium;
+   577→   577→      qty = 0;
+   578→   578→      orderTsyl = exec.execSymbol;
+   579→   579→      orderExchange = exec.exchange;
+   580→   580→      orderPrice = premium;
+   581→   581→      execDesc = `${exec.execSymbol} × ${execQty} (${lots} lot${lots > 1 ? "s" : ""}) @ ₹${premium.toFixed(2)}`;
+   582→   582→    } else {
+   583→   583→      qty = Math.max(1, Math.floor(config.capitalPerTrade / spec.entry));
+   584→   584→      execDesc = `${sym} × ${qty}`;
+   585→   585→    }
+   586→   586→
+   587→   587→    const entry = asset.kind === "EQUITY" ? roundTick(spec.entry * (1 + (spec.side === "LONG" ? SLIPPAGE : -SLIPPAGE))) : round2(spec.entry);
+   588→   588→
+   589→   589→    const trade = await db.scanTrade.create({
+   590→   590→      data: {
+   591→   591→        symbol: sym,
+   592→   592→        kind: asset.kind,
+   593→   593→        strategy: spec.strategy,
+   594→   594→        side: spec.side,
+   595→   595→        qty,
+   596→   596→        entryPrice: entry,
+   597→   597→        ltp: entry,
+   598→   598→        slPrice: spec.sl,
+   599→   599→        targetPrice: spec.target,
+   600→   600→        execSymbol,
+   601→   601→        execQty,
+   602→   602→        entryPremium,
+   603→   603→        ltpPremium: entryPremium,
+   604→   604→        mode: config.mode,
+   605→   605→        status: "OPEN",
+   606→   606→      },
+   607→   607→    });
+   608→   608→
+   609→   609→    await db.order.create({
+   610→   610→      data: {
+   611→   611→        deploymentId: null,
+   612→   612→        tsym: orderTsyl,
+   613→   613→        exchange: orderExchange,
+   614→   614→        side: spec.side === "LONG" ? "B" : "S",
+   615→   615→        qty: asset.kind === "EQUITY" ? qty : execQty,
+   616→   616→        price: orderPrice,
+   617→   617→        priceType: "MKT",
+   618→   618→        mode: config.mode,
+   619→   619→        status: "FILLED",
+   620→   620→        message:
+   621→   621→          config.mode === "LIVE"
+   622→   622→            ? `Live scanner order placed (${execDesc})`
+   623→   623→            : `Scanner paper fill @ ${asset.kind === "INDEX" ? `₹${(entryPremium ?? 0).toFixed(2)} prem` : `₹${entry.toFixed(2)}`}`,
+   624→   624→      },
+   625→   625→    });
+   626→   626→    await db.event
+   627→   627→      .create({
+   628→   628→        data: {
+   629→   629→          deploymentId: null,
+   630→   630→          type: "SCAN_ENTRY",
+   631→   631→          level: "TRADE",
+   632→   632→          message: `Scanner ${config.mode} ${spec.side} ${sym} (${spec.strategy}) entry ₹${spec.entry.toFixed(2)} — SL ₹${spec.sl.toFixed(2)}, target ₹${spec.target.toFixed(2)}. Exec: ${execDesc}.`,
+   633→   633→        },
+   634→   634→      })
+   635→   635→      .catch(() => {});
+   636→   636→
+   637→   637→    if (config.mode === "LIVE" && this.state.session) {
+   638→   638→      // fire the real order (best effort; fills tracked via broker)
+   639→   639→      await shoonyaPlaceOrder(
+   640→   640→        this.state.session.token,
+   641→   641→        this.state.session.actid,
+   642→   642→        this.state.session.userId,
+   643→   643→        {
+   644→   644→          exchange: orderExchange,
+   645→   645→          symbol: orderTsyl,
+   646→   646→          qty: asset.kind === "EQUITY" ? qty : execQty,
+   647→   647→          side: spec.side === "LONG" ? "B" : "S",
+   648→   648→          price: 0,
+   649→   649→          priceType: "MKT",
+   650→   650→          product: asset.kind === "EQUITY" ? "I" : "M",
+   651→   651→          remarks: "SA-SCAN",
+   652→   652→        },
+   653→   653→      ).catch(() => null);
+   654→   654→    }
+   655→   655→
+   656→   656→    return { id: trade.id };
+   657→   657→  }
+   658→   658→
+   659→   659→  // ---------- trade management ----------
+   660→   660→
+   661→   661→  private async manageOpenTrades(
+   662→   662→    config: { slPct: number; targetPct: number; squareOffTime: string; mode: string },
+   663→   663→    now: ReturnType<typeof istNow>,
+   664→   664→    marketOpen: boolean,
+   665→   665→  ) {
+   666→   666→    const open = await db.scanTrade.findMany({ where: { status: "OPEN" } });
+   667→   667→    const nowMin = now.hh * 60 + now.minute;
+   668→   668→    const soMin = hhmmToMinutes(config.squareOffTime);
+   669→   669→
+   670→   670→    for (const trade of open) {
+   671→   671→      const spot = this.price(trade.symbol);
+   672→   672→      if (!spot) continue;
+   673→   673→      const isIndex = trade.kind === "INDEX";
+   674→   674→
+   675→   675→      let closeStatus: string | null = null;
+   676→   676→      let closeMsg = "";
+   677→   677→      if (
+   678→   678→        trade.slPrice &&
+   679→   679→        ((trade.side === "LONG" && spot <= trade.slPrice) || (trade.side === "SHORT" && spot >= trade.slPrice))
+   680→   680→      ) {
+   681→   681→        closeStatus = "CLOSED_SL";
+   682→   682→        closeMsg = `Stop-loss level ₹${trade.slPrice.toFixed(2)} hit`;
+   683→   683→      } else if (
+   684→   684→        trade.targetPrice &&
+   685→   685→        ((trade.side === "LONG" && spot >= trade.targetPrice) || (trade.side === "SHORT" && spot <= trade.targetPrice))
+   686→   686→      ) {
+   687→   687→        closeStatus = "CLOSED_TARGET";
+   688→   688→        closeMsg = `Target level ₹${trade.targetPrice.toFixed(2)} reached`;
+   689→   689→      } else if (marketOpen && nowMin >= soMin) {
+   690→   690→        closeStatus = "CLOSED_TIME";
+   691→   691→        closeMsg = `Timed square-off at ${config.squareOffTime} IST`;
+   692→   692→      }
+   693→   693→
+   694→   694→      if (closeStatus) {
+   695→   695→        const exit = isIndex ? round2(spot) : roundTick(spot * (1 + (trade.side === "LONG" ? -SLIPPAGE : SLIPPAGE)));
+   696→   696→        let exitPremium: number | null = null;
+   697→   697→        let pnl = 0;
+   698→   698→        if (isIndex && trade.execSymbol && trade.entryPremium) {
+   699→   699→          const parsed = parseExecSymbol(trade.execSymbol);
+   700→   700→          if (parsed) {
+   701→   701→            const inst = INSTRUMENTS[parsed.instId];
+   702→   702→            const exec = {
+   703→   703→              execSymbol: trade.execSymbol,
+   704→   704→              exchange: inst.exchange,
+   705→   705→              execQty: trade.execQty,
+   706→   706→              strike: parsed.strike,
+   707→   707→              type: parsed.type,
+   708→   708→              settleMs: parsed.settleMs,
+   709→   709→              lotSize: inst.lotSize,
+   710→   710→              iv: inst.iv,
+   711→   711→            };
+   712→   712→            exitPremium = this.bsPremiumFor(exec, spot);
+   713→   713→            if (config.mode === "LIVE" && this.state.session) {
+   714→   714→              const lp = await shoonyaQuote(this.state.session.token, this.state.session.userId, inst.exchange, trade.execSymbol).catch(() => null);
+   715→   715→              if (lp && lp > 0) exitPremium = lp;
+   716→   716→            }
+   717→   717→            pnl = Math.round((exitPremium - trade.entryPremium) * trade.execQty * 100) / 100;
+   718→   718→          }
+   719→   719→        } else {
+   720→   720→          pnl = Math.round((trade.side === "LONG" ? 1 : -1) * (exit - trade.entryPrice) * trade.qty * 100) / 100;
+   721→   721→        }
+   722→   722→        await db.scanTrade.update({
+   723→   723→          where: { id: trade.id },
+   724→   724→          data: {
+   725→   725→            status: closeStatus,
+   726→   726→            exitPrice: exit,
+   727→   727→            ltp: exit,
+   728→   728→            exitPremium,
+   729→   729→            ltpPremium: exitPremium,
+   730→   730→            realizedPnl: pnl,
+   731→   731→            closedAt: new Date(),
+   732→   732→          },
+   733→   733→        });
+   734→   734→        await db.order.create({
+   735→   735→          data: {
+   736→   736→            deploymentId: null,
+   737→   737→            tsym: isIndex && trade.execSymbol ? trade.execSymbol : `${trade.symbol}-EQ`,
+   738→   738→            exchange: isIndex ? INSTRUMENTS[trade.symbol as InstrumentId]?.exchange ?? "NFO" : "NSE",
+   739→   739→            side: trade.side === "LONG" ? "S" : "B",
+   740→   740→            qty: isIndex ? trade.execQty : trade.qty,
+   741→   741→            price: isIndex ? exitPremium ?? 0 : exit,
+   742→   742→            priceType: "MKT",
+   743→   743→            mode: trade.mode,
+   744→   744→            status: "FILLED",
+   745→   745→            message: `Scanner exit (${closeStatus}) @ ${isIndex ? `₹${(exitPremium ?? 0).toFixed(2)} prem` : `₹${exit.toFixed(2)}`}`,
+   746→   746→          },
+   747→   747→        });
+   748→   748→        await db.event
+   749→   749→          .create({
+   750→   750→            data: {
+   751→   751→              deploymentId: null,
+   752→   752→              type: "SCAN_EXIT",
+   753→   753→              level: "TRADE",
+   754→   754→              message: `Scanner ${trade.side} ${trade.symbol} closed — ${closeMsg}. P&L ₹${pnl.toLocaleString("en-IN")}.`,
+   755→   755→            },
+   756→   756→          })
+   757→   757→          .catch(() => {});
+   758→   758→      } else {
+   759→   759→        const upd: Record<string, number> = {};
+   760→   760→        if (trade.ltp !== spot) upd.ltp = spot;
+   761→   761→        if (isIndex && trade.execSymbol) {
+   762→   762→          const parsed = parseExecSymbol(trade.execSymbol);
+   763→   763→          if (parsed) {
+   764→   764→            const inst = INSTRUMENTS[parsed.instId];
+   765→   765→            const prem = this.bsPremiumFor(
+   766→   766→              {
+   767→   767→                execSymbol: trade.execSymbol,
+   768→   768→                exchange: inst.exchange,
+   769→   769→                execQty: trade.execQty,
+   770→   770→                strike: parsed.strike,
+   771→   771→                type: parsed.type,
+   772→   772→                settleMs: parsed.settleMs,
+   773→   773→                lotSize: inst.lotSize,
+   774→   774→                iv: inst.iv,
+   775→   775→              },
+   776→   776→              spot,
+   777→   777→            );
+   778→   778→            if (prem !== trade.ltpPremium) upd.ltpPremium = prem;
+   779→   779→          }
+   780→   780→        }
+   781→   781→        if (Object.keys(upd).length > 0) {
+   782→   782→          await db.scanTrade.update({ where: { id: trade.id }, data: upd });
+   783→   783→        }
+   784→   784→      }
+   785→   785→    }
+   786→   786→    void config;
+   787→   787→  }
+   788→   788→
+   789→   789→  // ---------- manual ops ----------
+   790→   790→  async closeTrade(tradeId: string, reason = "CLOSED_MANUAL") {
+   791→   791→    const trade = await db.scanTrade.findUnique({ where: { id: tradeId } });
+   792→   792→    if (!trade || trade.status !== "OPEN") return;
+   793→   793→    const spot = this.price(trade.symbol) || trade.ltp || trade.entryPrice;
+   794→   794→    const isIndex = trade.kind === "INDEX";
+   795→   795→    const exit = isIndex ? round2(spot) : roundTick(spot * (1 + (trade.side === "LONG" ? -SLIPPAGE : SLIPPAGE)));
+   796→   796→    let exitPremium: number | null = null;
+   797→   797→    let pnl = 0;
+   798→   798→    if (isIndex && trade.execSymbol && trade.entryPremium) {
+   799→   799→      const parsed = parseExecSymbol(trade.execSymbol);
+   800→   800→      if (parsed) {
+   801→   801→        const inst = INSTRUMENTS[parsed.instId];
+   802→   802→        exitPremium = this.bsPremiumFor(
+   803→   803→          {
+   804→   804→            execSymbol: trade.execSymbol,
+   805→   805→            exchange: inst.exchange,
+   806→   806→            execQty: trade.execQty,
+   807→   807→            strike: parsed.strike,
+   808→   808→            type: parsed.type,
+   809→   809→            settleMs: parsed.settleMs,
+   810→   810→            lotSize: inst.lotSize,
+   811→   811→            iv: inst.iv,
+   812→   812→          },
+   813→   813→          spot,
+   814→   814→        );
+   815→   815→        pnl = Math.round((exitPremium - trade.entryPremium) * trade.execQty * 100) / 100;
+   816→   816→      }
+   817→   817→    } else {
+   818→   818→      pnl = Math.round((trade.side === "LONG" ? 1 : -1) * (exit - trade.entryPrice) * trade.qty * 100) / 100;
+   819→   819→    }
+   820→   820→    await db.scanTrade.update({
+   821→   821→      where: { id: trade.id },
+   822→   822→      data: {
+   823→   823→        status: reason,
+   824→   824→        exitPrice: exit,
+   825→   825→        ltp: exit,
+   826→   826→        exitPremium,
+   827→   827→        ltpPremium: exitPremium,
+   828→   828→        realizedPnl: pnl,
+   829→   829→        closedAt: new Date(),
+   830→   830→      },
+   831→   831→    });
+   832→   832→    await db.order.create({
+   833→   833→      data: {
+   834→   834→        deploymentId: null,
+   835→   835→        tsym: isIndex && trade.execSymbol ? trade.execSymbol : `${trade.symbol}-EQ`,
+   836→   836→        exchange: isIndex ? INSTRUMENTS[trade.symbol as InstrumentId]?.exchange ?? "NFO" : "NSE",
+   837→   837→        side: trade.side === "LONG" ? "S" : "B",
+   838→   838→        qty: isIndex ? trade.execQty : trade.qty,
+   839→   839→        price: isIndex ? exitPremium ?? 0 : exit,
+   840→   840→        priceType: "MKT",
+   841→   841→        mode: trade.mode,
+   842→   842→        status: "FILLED",
+   843→   843→        message: `Scanner manual exit @ ${isIndex ? `₹${(exitPremium ?? 0).toFixed(2)} prem` : `₹${exit.toFixed(2)}`}`,
+   844→   844→      },
+   845→   845→    });
+   846→   846→    await db.event
+   847→   847→      .create({
+   848→   848→        data: {
+   849→   849→          deploymentId: null,
+   850→   850→          type: "SCAN_EXIT",
+   851→   851→          level: "TRADE",
+   852→   852→          message: `Scanner ${trade.side} ${trade.symbol} closed manually @ ${isIndex ? `₹${(exitPremium ?? 0).toFixed(2)} prem` : `₹${exit.toFixed(2)}`}. P&L ₹${pnl.toLocaleString("en-IN")}.`,
+   853→   853→        },
+   854→   854→      })
+   855→   855→      .catch(() => {});
+   856→   856→  }
+   857→   857→
+   858→   858→  /** Re-arm the simulated day: forget opens, ranges, candles and signal cooldowns. */
+   859→   859→  resetDay() {
+   860→   860→    this.state.dayOpen.clear();
+   861→   861→    this.state.orbHigh.clear();
+   862→   862→    this.state.orbLow.clear();
+   863→   863→    this.state.orbTicks.clear();
+   864→   864→    this.state.cooldown.clear();
+   865→   865→    this.state.candles.clear();
+   866→   866→    this.state.cur.clear();
+   867→   867→    this.state.backfilled.clear();
+   868→   868→  }
+   869→   869→
+   870→   870→  universe(enabledSet: Set<string>, inTradeSet: Set<string>): ScannerUniverseRow[] {
+   871→   871→    const rows: ScannerUniverseRow[] = [];
+   872→   872→    for (const a of SCAN_ASSETS) {
+   873→   873→      const price = this.price(a.symbol);
+   874→   874→      const open = this.state.dayOpen.get(a.symbol) ?? price;
+   875→   875→      const hi = this.state.orbHigh.get(a.symbol) ?? null;
+   876→   876→      const lo = this.state.orbLow.get(a.symbol) ?? null;
+   877→   877→      const ticks = this.state.orbTicks.get(a.symbol) ?? 0;
+   878→   878→      let state: ScannerUniverseRow["state"] = "IDLE";
+   879→   879→      if (inTradeSet.has(a.symbol)) state = "IN_TRADE";
+   880→   880→      else if (this.state.cooldown.has(a.symbol)) state = "COOLDOWN";
+   881→   881→      else if (enabledSet.has(a.symbol)) state = "SCANNING";
+   882→   882→      rows.push({
+   883→   883→        symbol: a.symbol,
+   884→   884→        name: a.name,
+   885→   885→        kind: a.kind,
+   886→   886→        price: Math.round(price * 100) / 100,
+   887→   887→        dayOpen: Math.round(open * 100) / 100,
+   888→   888→        chgPct: open ? Math.round((price / open - 1) * 10000) / 100 : 0,
+   889→   889→        orbHigh: hi,
+   890→   890→        orbLow: lo,
+   891→   891→        rangeReady: ticks > ORB_TICKS,
+   892→   892→        bars: (this.state.candles.get(a.symbol) ?? []).length,
+   893→   893→        enabled: enabledSet.has(a.symbol),
+   894→   894→        state,
+   895→   895→      });
+   896→   896→    }
+   897→   897→    return rows;
+   898→   898→  }
+   899→   899→
+   900→   900→  sessionInfo() {
+   901→   901→    return this.state.session !== null;
+   902→   902→  }
+   903→   903→
+   904→   904→  patternCount() {
+   905→   905→    return PATTERN_DEFS.length;
+   906→   906→  }
+   907→   907→}
+   908→   908→
+   909→   909→export function getScanner(): Scanner {
+   910→   910→  const existing = g.__shoonyaAlgoScanner;
+   911→   911→  if (existing && existing.codeVersion === SCANNER_VERSION) return existing;
+   912→   912→  if (existing) {
+   913→   913→    try {
+   914→   914→      existing.stop();
+   915→   915→    } catch {
+   916→   916→      /* ignore */
+   917→   917→    }
+   918→   918→  }
+   919→   919→  const fresh = new Scanner();
+   920→   920→  g.__shoonyaAlgoScanner = fresh;
+   921→   921→  fresh.start();
+   922→   922→  return fresh;
+   923→   923→}
+   924→   924→

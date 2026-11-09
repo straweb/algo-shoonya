@@ -2,6 +2,8 @@
 // Prices are simulated anchors for the paper scanner (same approach as the
 // index paper engine); live mode replaces them with real NSE quotes.
 
+import { INSTRUMENT_LIST } from "./instruments";
+
 export interface StockDef {
   symbol: string;
   name: string;
@@ -89,4 +91,49 @@ export function parseSymbolsCSV(csv: string): string[] {
     .split(",")
     .map((s) => s.trim().toUpperCase())
     .filter((s) => s.length > 0 && STOCK_MAP[s] !== undefined);
+}
+
+// ---------- combined scan universe: indices + stocks ----------
+
+export interface ScanAsset {
+  symbol: string;
+  name: string;
+  kind: "INDEX" | "EQUITY";
+  basePrice: number;
+  vol: number; // annualised vol used by the paper walk
+  exchange?: "NFO" | "BFO"; // index spot quote exchange (live)
+}
+
+export const SCAN_ASSETS: ScanAsset[] = [
+  ...INSTRUMENT_LIST.map((i) => ({
+    symbol: i.id,
+    name: i.label,
+    kind: "INDEX" as const,
+    basePrice: i.basePrice,
+    vol: i.iv,
+    exchange: i.exchange,
+  })),
+  ...STOCK_UNIVERSE.map((s) => ({
+    symbol: s.symbol,
+    name: s.name,
+    kind: "EQUITY" as const,
+    basePrice: s.basePrice,
+    vol: s.vol,
+  })),
+];
+
+export const SCAN_ASSET_MAP: Record<string, ScanAsset> = Object.fromEntries(
+  SCAN_ASSETS.map((a) => [a.symbol, a]),
+);
+
+export function getScanAsset(symbol: string): ScanAsset | undefined {
+  return SCAN_ASSET_MAP[symbol];
+}
+
+/** CSV of enabled scanner symbols, validated against indices + stocks. */
+export function parseScanSymbols(csv: string): string[] {
+  return csv
+    .split(",")
+    .map((s) => s.trim().toUpperCase())
+    .filter((s) => s.length > 0 && SCAN_ASSET_MAP[s] !== undefined);
 }

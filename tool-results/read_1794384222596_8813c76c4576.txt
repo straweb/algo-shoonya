@@ -1,0 +1,570 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useMemo, useState } from "react";
+     4→import { Radar, RotateCcw, Save, Search, Zap, CircleDollarSign, Activity, Crosshair, Layers } from "lucide-react";
+     5→import { Button } from "@/components/ui/button";
+     6→import { Input } from "@/components/ui/input";
+     7→import { Label } from "@/components/ui/label";
+     8→import { Switch } from "@/components/ui/switch";
+     9→import { Badge } from "@/components/ui/badge";
+    10→import { Separator } from "@/components/ui/separator";
+    11→import {
+    12→  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+    13→} from "@/components/ui/select";
+    14→import { useToast } from "@/hooks/use-toast";
+    15→import { apiCall, usePoll } from "@/lib/use-poll";
+    16→import { inr, pnlClass, timeAgo } from "@/lib/client-types";
+    17→import { PATTERN_DEFS, BASE_STRATEGY_IDS } from "@/lib/patterns";
+    18→import { cn } from "@/lib/utils";
+    19→
+    20→interface ScanTradeRow {
+    21→  id: string;
+    22→  symbol: string;
+    23→  kind: string;
+    24→  strategy: string;
+    25→  side: string;
+    26→  qty: number;
+    27→  entryPrice: number;
+    28→  exitPrice: number | null;
+    29→  ltp: number | null;
+    30→  slPrice: number | null;
+    31→  targetPrice: number | null;
+    32→  execSymbol: string | null;
+    33→  execQty: number;
+    34→  entryPremium: number | null;
+    35→  ltpPremium: number | null;
+    36→  exitPremium: number | null;
+    37→  mode: string;
+    38→  status: string;
+    39→  realizedPnl: number;
+    40→  openedAt: string;
+    41→  closedAt: string | null;
+    42→}
+    43→
+    44→interface ScanSignalRow {
+    45→  id: string;
+    46→  symbol: string;
+    47→  strategy: string;
+    48→  side: string;
+    49→  refPrice: number;
+    50→  price: number;
+    51→  entryLevel: number | null;
+    52→  slLevel: number | null;
+    53→  targetLevel: number | null;
+    54→  note: string;
+    55→  placed: boolean;
+    56→  tradeId: string | null;
+    57→  createdAt: string;
+    58→}
+    59→
+    60→interface ScannerData {
+    61→  config: {
+    62→    enabled: boolean;
+    63→    strategies: string[];
+    64→    patternParams: Record<string, Record<string, number>>;
+    65→    candleSeconds: number;
+    66→    autoPlace: boolean;
+    67→    mode: string;
+    68→    capitalPerTrade: number;
+    69→    slPct: number;
+    70→    targetPct: number;
+    71→    squareOffTime: string;
+    72→    symbols: string[];
+    73→  };
+    74→  universe: Array<{
+    75→    symbol: string; name: string; kind: string; price: number; dayOpen: number; chgPct: number;
+    76→    orbHigh: number | null; orbLow: number | null; rangeReady: boolean; bars: number;
+    77→    enabled: boolean; state: string;
+    78→  }>;
+    79→  openTrades: ScanTradeRow[];
+    80→  closedTrades: ScanTradeRow[];
+    81→  signals: ScanSignalRow[];
+    82→  stats: { openTrades: number; realizedToday: number; unrealized: number; total: number; signalsToday: number };
+    83→}
+    84→
+    85→const STATE_STYLES: Record<string, string> = {
+    86→  SCANNING: "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300",
+    87→  IN_TRADE: "bg-teal-100 text-teal-800 dark:bg-teal-950 dark:text-teal-300",
+    88→  COOLDOWN: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300",
+    89→  IDLE: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400",
+    90→};
+    91→
+    92→const STRATEGY_LABELS: Record<string, string> = {
+    93→  ORB: "ORB",
+    94→  MOMENTUM: "Momentum",
+    95→  LIQUIDITY_SWEEP: "Liquidity Sweep",
+    96→  ORDER_BLOCK: "Order Block",
+    97→  HEAD_SHOULDERS: "Head & Shoulders",
+    98→  DOUBLE_BOTTOM: "Double Bottom",
+    99→  DOUBLE_TOP: "Double Top",
+   100→};
+   101→
+   102→export function Scanner() {
+   103→  const { toast } = useToast();
+   104→  const [data, refresh, loading] = usePoll<ScannerData>("/api/scanner", 3000);
+   105→  const [filter, setFilter] = useState("");
+   106→  const [cfg, setCfg] = useState<ScannerData["config"] | null>(null);
+   107→  const [saving, setSaving] = useState(false);
+   108→
+   109→  // sync local config editor when server data arrives and no local edits pending
+   110→  useEffect(() => {
+   111→    if (data?.config && !cfg) setCfg(data.config);
+   112→  }, [data, cfg]);
+   113→
+   114→  const act = async (body: Record<string, unknown>, okMsg?: string) => {
+   115→    try {
+   116→      await apiCall("/api/scanner", "POST", body);
+   117→      if (okMsg) toast({ title: okMsg });
+   118→      refresh();
+   119→    } catch (e) {
+   120→      toast({ title: "Action failed", description: (e as Error).message, variant: "destructive" });
+   121→    }
+   122→  };
+   123→
+   124→  const saveConfig = async () => {
+   125→    if (!cfg) return;
+   126→    setSaving(true);
+   127→    try {
+   128→      await apiCall("/api/scanner", "POST", {
+   129→        action: "setConfig",
+   130→        config: {
+   131→          enabled: cfg.enabled,
+   132→          strategies: cfg.strategies,
+   133→          patternParams: cfg.patternParams,
+   134→          candleSeconds: Number(cfg.candleSeconds),
+   135→          autoPlace: cfg.autoPlace,
+   136→          mode: cfg.mode,
+   137→          capitalPerTrade: Number(cfg.capitalPerTrade),
+   138→          slPct: Number(cfg.slPct),
+   139→          targetPct: Number(cfg.targetPct),
+   140→          squareOffTime: cfg.squareOffTime,
+   141→        },
+   142→      });
+   143→      toast({ title: "Scanner settings saved" });
+   144→      refresh();
+   145→    } catch (e) {
+   146→      toast({ title: "Could not save", description: (e as Error).message, variant: "destructive" });
+   147→    } finally {
+   148→      setSaving(false);
+   149→    }
+   150→  };
+   151→
+   152→  const toggleStrategy = (id: string, on: boolean) => {
+   153→    if (!cfg) return;
+   154→    const set = new Set(cfg.strategies);
+   155→    if (on) set.add(id);
+   156→    else set.delete(id);
+   157→    setCfg({ ...cfg, strategies: Array.from(set) });
+   158→  };
+   159→
+   160→  const setParam = (pid: string, key: string, value: number) => {
+   161→    if (!cfg) return;
+   162→    const pp = { ...cfg.patternParams };
+   163→    pp[pid] = { ...(pp[pid] ?? {}), [key]: value };
+   164→    setCfg({ ...cfg, patternParams: pp });
+   165→  };
+   166→
+   167→  const universe = useMemo(() => {
+   168→    if (!data) return [];
+   169→    const q = filter.trim().toUpperCase();
+   170→    return data.universe.filter((u) => !q || u.symbol.includes(q) || u.name.toUpperCase().includes(q));
+   171→  }, [data, filter]);
+   172→
+   173→  if (loading && !data) {
+   174→    return <div className="flex h-64 items-center justify-center text-sm text-muted-foreground">Loading scanner…</div>;
+   175→  }
+   176→  if (!data || !cfg) return null;
+   177→
+   178→  const serverEnabled = data.config.enabled;
+   179→  const px = (v: number, kind: string) => (kind === "INDEX" ? v.toFixed(2) : `₹${v.toFixed(2)}`);
+   180→
+   181→  return (
+   182→    <div className="space-y-5">
+   183→      <div className="flex flex-wrap items-center justify-between gap-3">
+   184→        <div>
+   185→          <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
+   186→            <Radar className={cn("h-5 w-5", serverEnabled ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground")} />
+   187→            Market Scanner
+   188→          </h1>
+   189→          <p className="text-sm text-muted-foreground">
+   190→            Spot price-action signals on indices &amp; F&amp;O stocks — liquidity sweep, order block, head &amp; shoulders,
+   191→            double top/bottom, ORB, momentum — each with an explicit entry, SL and target level, auto-placed.
+   192→          </p>
+   193→        </div>
+   194→        <div className="flex items-center gap-2">
+   195→          <div className={cn(
+   196→            "flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium",
+   197→            serverEnabled
+   198→              ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300"
+   199→              : "border-zinc-200 bg-zinc-50 text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400",
+   200→          )}>
+   201→            <span className={cn("h-2 w-2 rounded-full", serverEnabled ? "bg-emerald-500 animate-pulse" : "bg-zinc-400")} />
+   202→            {serverEnabled ? `Scanning · ${cfg.strategies.length} strategies` : "Scanner off"}
+   203→          </div>
+   204→          <Button variant="outline" size="sm" onClick={() => void act({ action: "resetDay" }, "Simulated day reset — ranges, candles and cooldowns cleared")}>
+   205→            <RotateCcw className="mr-1.5 h-3.5 w-3.5" /> Reset day
+   206→          </Button>
+   207→        </div>
+   208→      </div>
+   209→
+   210→      {/* stats */}
+   211→      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+   212→        <div className="rounded-lg border p-3">
+   213→          <span className="block text-xs text-muted-foreground">Signals today</span>
+   214→          <span className="text-lg font-semibold tabular-nums">{data.stats.signalsToday}</span>
+   215→        </div>
+   216→        <div className="rounded-lg border p-3">
+   217→          <span className="block text-xs text-muted-foreground">Open scan trades</span>
+   218→          <span className="text-lg font-semibold tabular-nums">{data.stats.openTrades}</span>
+   219→        </div>
+   220→        <div className="rounded-lg border p-3">
+   221→          <span className="block text-xs text-muted-foreground">Realized (recent closed)</span>
+   222→          <span className={cn("text-lg font-semibold tabular-nums", pnlClass(data.stats.realizedToday))}>
+   223→            {inr(data.stats.realizedToday, { sign: true })}
+   224→          </span>
+   225→        </div>
+   226→        <div className="rounded-lg border p-3">
+   227→          <span className="block text-xs text-muted-foreground">Unrealized (open)</span>
+   228→          <span className={cn("text-lg font-semibold tabular-nums", pnlClass(data.stats.unrealized))}>
+   229→            {inr(data.stats.unrealized, { sign: true })}
+   230→          </span>
+   231→        </div>
+   232→      </div>
+   233→
+   234→      <div className="grid gap-5 xl:grid-cols-[1fr_380px]">
+   235→        <div className="space-y-5">
+   236→          {/* strategies */}
+   237→          <div className="rounded-lg border p-4">
+   238→            <div className="mb-3 flex items-center justify-between">
+   239→              <span className="flex items-center gap-2 text-sm font-medium">
+   240→                <Crosshair className="h-4 w-4 text-emerald-600 dark:text-emerald-400" /> Strategies &amp; levels
+   241→              </span>
+   242→              <div className="flex items-center gap-2">
+   243→                <Label htmlFor="scan-enabled" className="text-xs text-muted-foreground">Scanner {cfg.enabled ? "on" : "off"}</Label>
+   244→                <Switch id="scan-enabled" checked={cfg.enabled} onCheckedChange={(c) => setCfg({ ...cfg, enabled: c })} />
+   245→              </div>
+   246→            </div>
+   247→            <div className="grid gap-2 sm:grid-cols-2">
+   248→              {BASE_STRATEGY_IDS.map((id) => (
+   249→                <label
+   250→                  key={id}
+   251→                  className={cn(
+   252→                    "flex cursor-pointer items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm",
+   253→                    cfg.strategies.includes(id) ? "border-emerald-300 bg-emerald-50/60 dark:border-emerald-800 dark:bg-emerald-950/30" : "hover:bg-accent/40",
+   254→                  )}
+   255→                >
+   256→                  <input
+   257→                    type="checkbox"
+   258→                    className="h-3.5 w-3.5 accent-emerald-600"
+   259→                    checked={cfg.strategies.includes(id)}
+   260→                    onChange={(e) => toggleStrategy(id, e.target.checked)}
+   261→                  />
+   262→                  <span className="font-medium">{STRATEGY_LABELS[id]}</span>
+   263→                  <span className="ml-auto text-xs text-muted-foreground">
+   264→                    {id === "ORB" ? "opening-range breakout" : "0.5% from open"}
+   265→                  </span>
+   266→                </label>
+   267→              ))}
+   268→              {PATTERN_DEFS.map((p) => (
+   269→                <div
+   270→                  key={p.id}
+   271→                  className={cn(
+   272→                    "rounded-md border text-sm",
+   273→                    cfg.strategies.includes(p.id) ? "border-emerald-300 bg-emerald-50/60 dark:border-emerald-800 dark:bg-emerald-950/30" : "hover:bg-accent/40",
+   274→                  )}
+   275→                >
+   276→                  <label className="flex cursor-pointer items-center gap-2.5 px-3 py-2.5">
+   277→                    <input
+   278→                      type="checkbox"
+   279→                      className="h-3.5 w-3.5 accent-emerald-600"
+   280→                      checked={cfg.strategies.includes(p.id)}
+   281→                      onChange={(e) => toggleStrategy(p.id, e.target.checked)}
+   282→                    />
+   283→                    <span className="font-medium">{p.label}</span>
+   284→                    <span className="ml-auto text-xs text-muted-foreground">{p.short}</span>
+   285→                  </label>
+   286→                  {cfg.strategies.includes(p.id) && (
+   287→                    <div className="grid grid-cols-2 gap-2 border-t px-3 py-2.5">
+   288→                      {p.params.map((pd) => (
+   289→                        <div key={pd.key} className="space-y-0.5">
+   290→                          <Label htmlFor={`${p.id}-${pd.key}`} className="text-[11px] text-muted-foreground">
+   291→                            {pd.label}
+   292→                          </Label>
+   293→                          <Input
+   294→                            id={`${p.id}-${pd.key}`}
+   295→                            type="number"
+   296→                            min={pd.min}
+   297→                            max={pd.max}
+   298→                            step={pd.step}
+   299→                            className="h-8 text-xs"
+   300→                            value={cfg.patternParams[p.id]?.[pd.key] ?? pd.def}
+   301→                            onChange={(e) => setParam(p.id, pd.key, Number(e.target.value))}
+   302→                          />
+   303→                        </div>
+   304→                      ))}
+   305→                    </div>
+   306→                  )}
+   307→                </div>
+   308→              ))}
+   309→            </div>
+   310→            <p className="mt-2 text-xs text-muted-foreground">
+   311→              Pattern signals are confirmed on candle close and trade against explicit levels: entry at the trigger,
+   312→              SL beyond the invalidated structure (sweep wick / OB far edge / shoulder / pattern extreme), target at an
+   313→              R-multiple or the measured move.
+   314→            </p>
+   315→          </div>
+   316→
+   317→          {/* config */}
+   318→          <div className="rounded-lg border p-4">
+   319→            <div className="mb-3 flex items-center justify-between">
+   320→              <span className="flex items-center gap-2 text-sm font-medium">
+   321→                <Zap className="h-4 w-4 text-emerald-600 dark:text-emerald-400" /> Execution
+   322→              </span>
+   323→            </div>
+   324→            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+   325→              <div className="space-y-1">
+   326→                <Label>Execution mode</Label>
+   327→                <Select value={cfg.mode} onValueChange={(v) => setCfg({ ...cfg, mode: v })}>
+   328→                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+   329→                  <SelectContent>
+   330→                    <SelectItem value="PAPER">Paper (simulated)</SelectItem>
+   331→                    <SelectItem value="LIVE">Live (Shoonya orders)</SelectItem>
+   332→                  </SelectContent>
+   333→                </Select>
+   334→                {cfg.mode === "LIVE" && (
+   335→                  <p className="text-xs text-amber-600 dark:text-amber-400">Places real market orders — needs an active Shoonya session.</p>
+   336→                )}
+   337→              </div>
+   338→              <div className="space-y-1">
+   339→                <Label>Candle length (patterns)</Label>
+   340→                <Select value={String(cfg.candleSeconds)} onValueChange={(v) => setCfg({ ...cfg, candleSeconds: Number(v) })}>
+   341→                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+   342→                  <SelectContent>
+   343→                    <SelectItem value="15">15 seconds</SelectItem>
+   344→                    <SelectItem value="30">30 seconds</SelectItem>
+   345→                    <SelectItem value="60">1 minute</SelectItem>
+   346→                    <SelectItem value="120">2 minutes</SelectItem>
+   347→                    <SelectItem value="300">5 minutes</SelectItem>
+   348→                  </SelectContent>
+   349→                </Select>
+   350→              </div>
+   351→              <div className="space-y-1">
+   352→                <Label>Auto-place trades</Label>
+   353→                <div className="flex h-9 items-center gap-2">
+   354→                  <Switch id="auto-place" checked={cfg.autoPlace} onCheckedChange={(c) => setCfg({ ...cfg, autoPlace: c })} />
+   355→                  <Label htmlFor="auto-place" className="text-xs font-normal text-muted-foreground">
+   356→                    {cfg.autoPlace ? "Signals become trades instantly" : "Signals are logged only"}
+   357→                  </Label>
+   358→                </div>
+   359→              </div>
+   360→              <div className="space-y-1">
+   361→                <Label htmlFor="scan-capital">Capital per trade (₹)</Label>
+   362→                <Input id="scan-capital" type="number" min={1000} step={10000} value={cfg.capitalPerTrade}
+   363→                  onChange={(e) => setCfg({ ...cfg, capitalPerTrade: Number(e.target.value) })} />
+   364→                <p className="text-xs text-muted-foreground">Stocks: qty = capital ÷ LTP. Indices: ATM option lots (CE on long, PE on short).</p>
+   365→              </div>
+   366→              <div className="grid grid-cols-2 gap-3">
+   367→                <div className="space-y-1">
+   368→                  <Label htmlFor="scan-sl">SL % <span className="text-[10px] text-muted-foreground">(ORB/Mom)</span></Label>
+   369→                  <Input id="scan-sl" type="number" min={0.1} step={0.1} value={cfg.slPct}
+   370→                    onChange={(e) => setCfg({ ...cfg, slPct: Number(e.target.value) })} />
+   371→                </div>
+   372→                <div className="space-y-1">
+   373→                  <Label htmlFor="scan-tgt">Target % <span className="text-[10px] text-muted-foreground">(ORB/Mom)</span></Label>
+   374→                  <Input id="scan-tgt" type="number" min={0.1} step={0.1} value={cfg.targetPct}
+   375→                    onChange={(e) => setCfg({ ...cfg, targetPct: Number(e.target.value) })} />
+   376→                </div>
+   377→              </div>
+   378→              <div className="space-y-1">
+   379→                <Label htmlFor="scan-so">Square-off (IST)</Label>
+   380→                <Input id="scan-so" type="time" value={cfg.squareOffTime}
+   381→                  onChange={(e) => setCfg({ ...cfg, squareOffTime: e.target.value })} />
+   382→              </div>
+   383→            </div>
+   384→            <div className="mt-4 flex justify-end">
+   385→              <Button size="sm" onClick={() => void saveConfig()} disabled={saving} className="bg-emerald-600 hover:bg-emerald-700">
+   386→                <Save className="mr-1.5 h-3.5 w-3.5" />{saving ? "Saving…" : "Apply settings"}
+   387→              </Button>
+   388→            </div>
+   389→          </div>
+   390→
+   391→          {/* universe */}
+   392→          <div className="rounded-lg border">
+   393→            <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
+   394→              <span className="flex items-center gap-2 text-sm font-medium">
+   395→                <Layers className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+   396→                Universe — {data.config.symbols.length}/{data.universe.length} enabled
+   397→              </span>
+   398→              <div className="flex items-center gap-2">
+   399→                <div className="relative">
+   400→                  <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+   401→                  <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter symbols"
+   402→                    className="h-8 w-40 pl-8 text-xs" />
+   403→                </div>
+   404→                <Button variant="outline" size="sm" className="h-8"
+   405→                  onClick={() => void act({ action: "setAllSymbols", on: true }, `All ${data.universe.length} symbols enabled`)}>All</Button>
+   406→                <Button variant="outline" size="sm" className="h-8"
+   407→                  onClick={() => void act({ action: "setAllSymbols", on: false }, "All symbols disabled")}>None</Button>
+   408→              </div>
+   409→            </div>
+   410→            <div className="max-h-[26rem] overflow-y-auto">
+   411→              <table className="w-full text-sm">
+   412→                <thead className="sticky top-0 bg-muted/70 text-left text-xs uppercase tracking-wide text-muted-foreground backdrop-blur">
+   413→                  <tr>
+   414→                    <th className="px-3 py-2 font-medium">Scan</th>
+   415→                    <th className="px-3 py-2 font-medium">Symbol</th>
+   416→                    <th className="px-3 py-2 text-right font-medium">LTP</th>
+   417→                    <th className="px-3 py-2 text-right font-medium">Chg%</th>
+   418→                    <th className="px-3 py-2 text-right font-medium">Candles</th>
+   419→                    <th className="px-3 py-2 text-right font-medium">State</th>
+   420→                  </tr>
+   421→                </thead>
+   422→                <tbody>
+   423→                  {universe.map((u) => (
+   424→                    <tr key={u.symbol} className={cn("border-t", u.enabled && "bg-emerald-50/40 dark:bg-emerald-950/20")}>
+   425→                      <td className="px-3 py-2">
+   426→                        <Switch checked={u.enabled} onCheckedChange={(c) => void act({ action: "toggleSymbol", symbol: u.symbol, on: c })} />
+   427→                      </td>
+   428→                      <td className="px-3 py-2">
+   429→                        <span className="flex items-center gap-1.5 font-medium">
+   430→                          {u.symbol}
+   431→                          <Badge variant="outline" className={cn("text-[9px]", u.kind === "INDEX" && "border-sky-300 text-sky-700 dark:border-sky-800 dark:text-sky-300")}>
+   432→                            {u.kind}
+   433→                          </Badge>
+   434→                        </span>
+   435→                        <span className="block text-xs text-muted-foreground">{u.name}</span>
+   436→                      </td>
+   437→                      <td className="px-3 py-2 text-right tabular-nums">{px(u.price, u.kind)}</td>
+   438→                      <td className={cn("px-3 py-2 text-right tabular-nums", pnlClass(u.chgPct))}>
+   439→                        {u.chgPct >= 0 ? "+" : ""}{u.chgPct.toFixed(2)}%
+   440→                      </td>
+   441→                      <td className="px-3 py-2 text-right text-xs tabular-nums text-muted-foreground">
+   442→                        {u.bars > 0 ? u.bars : <span className="italic">warming up…</span>}
+   443→                      </td>
+   444→                      <td className="px-3 py-2 text-right">
+   445→                        <Badge className={cn("text-[10px]", STATE_STYLES[u.state])}>{u.state.replace("_", " ")}</Badge>
+   446→                      </td>
+   447→                    </tr>
+   448→                  ))}
+   449→                </tbody>
+   450→              </table>
+   451→            </div>
+   452→          </div>
+   453→        </div>
+   454→
+   455→        {/* right rail: signals + trades */}
+   456→        <div className="space-y-5">
+   457→          <div className="rounded-lg border">
+   458→            <div className="flex items-center gap-2 border-b px-4 py-3 text-sm font-medium">
+   459→              <Activity className="h-4 w-4 text-emerald-600 dark:text-emerald-400" /> Signals
+   460→            </div>
+   461→            <div className="max-h-72 space-y-2 overflow-y-auto p-3">
+   462→              {data.signals.length === 0 && (
+   463→                <p className="py-6 text-center text-sm text-muted-foreground">No signals yet — enable symbols and wait for a candle-close setup.</p>
+   464→              )}
+   465→              {data.signals.map((s) => (
+   466→                <div key={s.id} className="rounded-md border p-2.5 text-xs">
+   467→                  <div className="flex items-center justify-between gap-2">
+   468→                    <span className="flex items-center gap-1.5 font-medium">
+   469→                      <Badge variant={s.side === "LONG" ? "secondary" : "destructive"} className="text-[10px]">{s.side}</Badge>
+   470→                      {s.symbol}
+   471→                      <span className="text-muted-foreground">· {STRATEGY_LABELS[s.strategy] ?? s.strategy}</span>
+   472→                    </span>
+   473→                    <span className="text-muted-foreground">{timeAgo(s.createdAt)}</span>
+   474→                  </div>
+   475→                  <p className="mt-1 text-muted-foreground">{s.note}</p>
+   476→                  <p className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 tabular-nums">
+   477→                    <CircleDollarSign className="h-3 w-3" />
+   478→                    <span>E {px(s.entryLevel ?? s.price, "INDEX")}</span>
+   479→                    <span className="text-red-600 dark:text-red-400">SL {px(s.slLevel ?? 0, "INDEX")}</span>
+   480→                    <span className="text-emerald-600 dark:text-emerald-400">TP {px(s.targetLevel ?? 0, "INDEX")}</span>
+   481→                    {s.placed
+   482→                      ? <Badge className="ml-1 bg-teal-100 text-teal-800 dark:bg-teal-950 dark:text-teal-300 text-[10px]">trade placed</Badge>
+   483→                      : <Badge variant="outline" className="ml-1 text-[10px]">logged only</Badge>}
+   484→                  </p>
+   485→                </div>
+   486→              ))}
+   487→            </div>
+   488→          </div>
+   489→
+   490→          <div className="rounded-lg border">
+   491→            <div className="flex items-center gap-2 border-b px-4 py-3 text-sm font-medium">
+   492→              <Zap className="h-4 w-4 text-emerald-600 dark:text-emerald-400" /> Open scan trades
+   493→            </div>
+   494→            <div className="max-h-64 space-y-2 overflow-y-auto p-3">
+   495→              {data.openTrades.length === 0 && (
+   496→                <p className="py-6 text-center text-sm text-muted-foreground">No open scan trades.</p>
+   497→              )}
+   498→              {data.openTrades.map((t) => {
+   499→                const isIndex = t.kind === "INDEX";
+   500→                const unrl = isIndex
+   501→                  ? ((t.ltpPremium ?? t.entryPremium ?? 0) - (t.entryPremium ?? 0)) * t.execQty
+   502→                  : (t.side === "LONG" ? 1 : -1) * ((t.ltp ?? t.entryPrice) - t.entryPrice) * t.qty;
+   503→                return (
+   504→                  <div key={t.id} className="rounded-md border p-2.5 text-xs">
+   505→                    <div className="flex items-center justify-between">
+   506→                      <span className="flex items-center gap-1.5 font-medium">
+   507→                        <Badge variant={t.side === "LONG" ? "secondary" : "destructive"} className="text-[10px]">{t.side}</Badge>
+   508→                        {t.symbol} <span className="text-muted-foreground">· {STRATEGY_LABELS[t.strategy] ?? t.strategy}</span>
+   509→                        <Badge variant="outline" className="text-[10px]">{t.mode}</Badge>
+   510→                      </span>
+   511→                      <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => void act({ action: "closeTrade", id: t.id })}>
+   512→                        Close
+   513→                      </Button>
+   514→                    </div>
+   515→                    {isIndex ? (
+   516→                      <div className="mt-1 space-y-0.5 tabular-nums text-muted-foreground">
+   517→                        <span className="block">exec {t.execSymbol} × {t.execQty}</span>
+   518→                        <span className="block">
+   519→                          spot ₹{(t.ltp ?? t.entryPrice).toFixed(2)} · prem ₹{(t.ltpPremium ?? t.entryPremium ?? 0).toFixed(2)}
+   520→                          {t.entryPremium ? ` (in ₹${t.entryPremium.toFixed(2)})` : ""}
+   521→                        </span>
+   522→                        <span className="block">SL ₹{(t.slPrice ?? 0).toFixed(2)} · TP ₹{(t.targetPrice ?? 0).toFixed(2)} <span className="text-[10px]">(spot levels)</span></span>
+   523→                      </div>
+   524→                    ) : (
+   525→                      <div className="mt-1 grid grid-cols-3 gap-1 tabular-nums text-muted-foreground">
+   526→                        <span>entry ₹{t.entryPrice.toFixed(2)}</span>
+   527→                        <span>ltp ₹{(t.ltp ?? t.entryPrice).toFixed(2)}</span>
+   528→                        <span>SL ₹{(t.slPrice ?? 0).toFixed(2)} · TP ₹{(t.targetPrice ?? 0).toFixed(2)}</span>
+   529→                      </div>
+   530→                    )}
+   531→                    <p className={cn("mt-1 font-medium tabular-nums", pnlClass(unrl))}>Unrealized {inr(unrl, { sign: true })}</p>
+   532→                  </div>
+   533→                );
+   534→              })}
+   535→            </div>
+   536→          </div>
+   537→
+   538→          <div className="rounded-lg border">
+   539→            <div className="border-b px-4 py-3 text-sm font-medium">Closed scan trades</div>
+   540→            <div className="max-h-56 space-y-1.5 overflow-y-auto p-3">
+   541→              {data.closedTrades.length === 0 && (
+   542→                <p className="py-6 text-center text-sm text-muted-foreground">No closed trades yet.</p>
+   543→              )}
+   544→              {data.closedTrades.map((t) => (
+   545→                <div key={t.id} className="flex items-center justify-between rounded-md border px-2.5 py-2 text-xs">
+   546→                  <span className="font-medium">
+   547→                    {t.symbol} <span className="text-muted-foreground">· {t.side} · {STRATEGY_LABELS[t.strategy] ?? t.strategy}</span>
+   548→                  </span>
+   549→                  <span className="flex items-center gap-2">
+   550→                    <span className="text-muted-foreground">{t.status.replace("CLOSED_", "").replace("_", " ")}</span>
+   551→                    <span className={cn("font-medium tabular-nums", pnlClass(t.realizedPnl))}>{inr(t.realizedPnl, { sign: true })}</span>
+   552→                  </span>
+   553→                </div>
+   554→              ))}
+   555→            </div>
+   556→          </div>
+   557→
+   558→          <Separator />
+   559→          <p className="text-xs text-muted-foreground">
+   560→            Paper mode simulates walks for all 6 indices and 50 F&amp;O stocks and seeds candle history so patterns fire
+   561→            immediately; live mode pulls real quotes (index spot via NFO/BFO, stocks via {"<SYMBOL>"}-EQ). Index signals
+   562→            execute as ATM options (CE on LONG, PE on SHORT) with P&amp;L in premium; stock signals execute as cash
+   563→            market orders. One signal per symbol per day; one open trade per symbol.
+   564→          </p>
+   565→        </div>
+   566→      </div>
+   567→    </div>
+   568→  );
+   569→}
+   570→
